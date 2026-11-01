@@ -1,0 +1,25 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*.json
+secrets*.json
+
+# Private source media, drafts, receipts, logs, runtime state
+/media/
+/captures/
+/private/
+/state/
+/output/
+/logs/
+*.log
+
+# Local development
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+Thumbs.db
