@@ -1,0 +1,42 @@
+{
+  "schema_version": "0.1-proposed",
+  "synthetic_example": true,
+  "event_id": "example-event-001",
+  "state": "drafted",
+  "source": {
+    "asset_ids": ["example-asset-001"],
+    "capture_time": null,
+    "capture_timezone_known": false,
+    "public_location": null
+  },
+  "observations": [
+    {
+      "claim": "One raccoon is visible looking toward the camera.",
+      "source_asset_ids": ["example-asset-001"],
+      "certainty": "illustrative-only"
+    }
+  ],
+  "uncertainties": [
+    "This example is fictional and has no real source capture.",
+    "A single still does not establish duration or a sequence of actions.",
+    "Individual identity is unknown."
+  ],
+  "editorial": {
+    "section": "Local Affairs",
+    "headline": "RACCOON PAUSES FOR UNSCHEDULED CAMERA INSPECTION",
+    "caption": "A raccoon appears facing the camera in this fictional example. The frame offers no evidence of what happened before or after the image.\n\nThe inspection's findings remain unavailable.",
+    "character_label": null
+  },
+  "eligibility": {
+    "privacy_check": "not_evaluated",
+    "factual_support_check": "not_evaluated",
+    "publishable": false,
+    "hold_reasons": ["Synthetic example. Never publish as a real sighting."]
+  },
+  "publication": {
+    "destination": "instagram",
+    "remote_post_id": null,
+    "published_at": null,
+    "attempts": []
+  }
+}
