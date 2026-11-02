@@ -306,5 +306,57 @@ def reconcile_publication(
     )
 
 
+@mcp.tool()
+def pair_all_photo_video_companions() -> str:
+    """
+    Automatically pair all still-image sightings with their companion 10-second camera
+    videos (`0 <= delta <= 25s`), caching the `.mp4` and marking standalone companion
+    video records with `paired_into_event_id`.
+    """
+    return _safe_json_response(wildlife_desk.pair_all_photo_video_companions)
+
+
+@mcp.tool()
+def compute_publication_schedule(
+    schedule_days: str = "tue,thu,sat",
+    schedule_hour_local: int = 8,
+    min_hours_between_posts: float = 36.0,
+) -> str:
+    """
+    Compute the ordered multi-week publication schedule for all `ready` dispatches
+    on fixed days of the week (default: Tue / Thu / Sat at 08:00 local time),
+    interleaving species whenever possible.
+    """
+    return _safe_json_response(
+        wildlife_desk.compute_publication_schedule,
+        schedule_days=schedule_days,
+        schedule_hour_local=schedule_hour_local,
+        min_hours_between_posts=min_hours_between_posts,
+    )
+
+
+@mcp.tool()
+def drip_publish(
+    force: bool = False,
+    dry_run: bool = False,
+    schedule_days: str = "tue,thu,sat",
+    schedule_hour_local: int = 8,
+    min_hours_between_posts: float = 36.0,
+) -> str:
+    """
+    Publish at most one `ready` dispatch if today is a scheduled publication day
+    (default: Tue / Thu / Sat at or after 08:00 local time) and the minimum cooldown
+    (`min_hours_between_posts=36.0`) since the last published post has elapsed.
+    """
+    return _safe_json_response(
+        wildlife_desk.drip_publish,
+        force=force,
+        dry_run=dry_run,
+        schedule_days=schedule_days,
+        schedule_hour_local=schedule_hour_local,
+        min_hours_between_posts=min_hours_between_posts,
+    )
+
+
 if __name__ == "__main__":
     mcp.run()

@@ -1097,6 +1097,7 @@ def load_dispatch_record(
 
 def list_dispatches(
     state_filter: Optional[str] = None,
+    include_paired_companions: bool = False,
     env_override: Optional[Dict[str, str]] = None,
     repo_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
@@ -1109,6 +1110,8 @@ def list_dispatches(
         try:
             rec = json.loads(p.read_text(encoding="utf-8"))
         except Exception:
+            continue
+        if not include_paired_companions and (rec.get("source") or {}).get("paired_into_event_id"):
             continue
         st = rec.get("state", "discovered")
         counts_by_state[st] = counts_by_state.get(st, 0) + 1
@@ -1984,7 +1987,9 @@ def find_companion_video_event(
     if base_epoch is None:
         return None
 
-    all_dispatches = list_dispatches(env_override=env_override, repo_dir=repo_dir)["dispatches"]
+    all_dispatches = list_dispatches(
+        include_paired_companions=True, env_override=env_override, repo_dir=repo_dir
+    )["dispatches"]
     best_eid: Optional[str] = None
     best_delta = float("inf")
     for cand in all_dispatches:
@@ -2001,8 +2006,8 @@ def find_companion_video_event(
         if c_epoch is None:
             continue
         delta = c_epoch - base_epoch
-        if -2.0 <= delta <= max_delta_seconds and abs(delta) < best_delta:
-            best_delta = abs(delta)
+        if 0.0 <= delta <= max_delta_seconds and delta < best_delta:
+            best_delta = delta
             best_eid = cid
     return best_eid
 
@@ -2010,6 +2015,7 @@ def find_companion_video_event(
 def attach_video_to_dispatch(
     event_id: str,
     video_event_id: Optional[str] = None,
+    force_replace: bool = False,
     env_override: Optional[Dict[str, str]] = None,
     repo_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
@@ -2026,12 +2032,11 @@ def attach_video_to_dispatch(
     dispatch_path = dirs["dispatches"] / f"{event_id}.json"
     record = load_dispatch_record(event_id, env_override=env_override, repo_dir=repo_dir)
 
-    # Case 1: event already has a video asset
-    existing_vid = ensure_event_video_cached(event_id, env_override=env_override, repo_dir=repo_dir)
-    if existing_vid and not video_event_id:
-        return load_dispatch_record(event_id, env_override=env_override, repo_dir=repo_dir)
+    if not force_replace:
+        existing_vid = ensure_event_video_cached(event_id, env_override=env_override, repo_dir=repo_dir)
+        if existing_vid and not video_event_id:
+            return load_dispatch_record(event_id, env_override=env_override, repo_dir=repo_dir)
 
-    # Case 2: pair with companion video event
     resolved_vid_eid = video_event_id or find_companion_video_event(
         event_id, env_override=env_override, repo_dir=repo_dir
     )
@@ -2061,6 +2066,10 @@ def attach_video_to_dispatch(
     vid_asset["cached_video_path"] = str(local_vid_copy)
 
     src = record.setdefault("source", {})
+    if force_replace:
+        src["assets"] = [a for a in src.get("assets", []) if a.get("media_type") != "video"]
+        src["asset_ids"] = [a["asset_id"] for a in src["assets"]]
+
     asset_ids = src.setdefault("asset_ids", [])
     if vid_asset["asset_id"] not in asset_ids:
         asset_ids.append(vid_asset["asset_id"])
@@ -2073,7 +2082,6 @@ def attach_video_to_dispatch(
     prod["video_path"] = str(local_vid_copy)
     prod["post_format"] = "carousel_video"
 
-    # Remove single-still-only default uncertainty if present
     record["uncertainties"] = [
         u
         for u in (record.get("uncertainties") or [])
@@ -2081,7 +2089,49 @@ def attach_video_to_dispatch(
     ]
 
     _save_dispatch_record(dispatch_path, record, config)
+
+    vid_dispatch_path = dirs["dispatches"] / f"{resolved_vid_eid}.json"
+    vid_record.setdefault("source", {})["paired_into_event_id"] = event_id
+    if vid_record.get("state") == "discovered":
+        vid_record["state"] = "held"
+        vid_record.setdefault("eligibility", {})["publishable"] = False
+        vid_record["eligibility"]["hold_reasons"] = [
+            f"Paired as Slide 2 (10-second camera video) of dispatch {event_id}."
+        ]
+    _save_dispatch_record(vid_dispatch_path, vid_record, config)
+
     return record
+
+
+def pair_all_photo_video_companions(
+    env_override: Optional[Dict[str, str]] = None,
+    repo_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """
+    Automatically pair all still-image sightings with their companion 10-second camera
+    videos (`0 <= delta <= 25s`), caching the `.mp4` and marking the standalone video
+    records with `paired_into_event_id`.
+    """
+    all_records = list_dispatches(
+        include_paired_companions=True, env_override=env_override, repo_dir=repo_dir
+    )["dispatches"]
+    paired_map: Dict[str, str] = {}
+    for rec in all_records:
+        assets = (rec.get("source") or {}).get("assets") or []
+        if not assets or assets[0].get("media_type") != "image":
+            continue
+        eid = rec["event_id"]
+        comp_eid = find_companion_video_event(eid, env_override=env_override, repo_dir=repo_dir)
+        if comp_eid:
+            attach_video_to_dispatch(
+                eid,
+                video_event_id=comp_eid,
+                force_replace=True,
+                env_override=env_override,
+                repo_dir=repo_dir,
+            )
+            paired_map[eid] = comp_eid
+    return {"paired_count": len(paired_map), "pairs": paired_map}
 
 
 # ---------------------------------------------------------------------------
@@ -2607,6 +2657,226 @@ def reconcile_publication(
 
 
 # ---------------------------------------------------------------------------
+# Fixed-Schedule Multi-Week Drip Publisher (Tue / Thu / Sat Morning Editions)
+# ---------------------------------------------------------------------------
+
+WEEKDAY_MAP = {
+    "mon": 0,
+    "tue": 1,
+    "wed": 2,
+    "thu": 3,
+    "fri": 4,
+    "sat": 5,
+    "sun": 6,
+}
+
+
+def _primary_species(record: Dict[str, Any]) -> str:
+    for obs in record.get("observations") or []:
+        sp = str(obs.get("species") or "").strip().lower()
+        if sp and sp not in ("none", "unknown"):
+            return sp
+    return "unknown"
+
+
+def _parse_schedule_weekdays(raw_days: str = "tue,thu,sat") -> List[int]:
+    days: List[int] = []
+    for tok in str(raw_days or "tue,thu,sat").split(","):
+        key = tok.strip().lower()[:3]
+        if key in WEEKDAY_MAP and WEEKDAY_MAP[key] not in days:
+            days.append(WEEKDAY_MAP[key])
+    return sorted(days) if days else [1, 3, 5]
+
+
+def compute_publication_schedule(
+    schedule_days: str = "tue,thu,sat",
+    schedule_hour_local: int = 8,
+    min_hours_between_posts: float = 36.0,
+    now_dt: Optional[dt.datetime] = None,
+    env_override: Optional[Dict[str, str]] = None,
+    repo_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """
+    Compute the ordered multi-week publication schedule for all `ready` dispatches
+    on fixed days of the week (default: Tue / Thu / Sat at 08:00 local time),
+    interleaving species whenever possible so consecutive posts vary species.
+    """
+    listed = list_dispatches(env_override=env_override, repo_dir=repo_dir)["dispatches"]
+    ready_list = [r for r in listed if r.get("state") == "ready"]
+    published_list = [r for r in listed if r.get("state") == "published"]
+
+    ready_sorted = sorted(
+        ready_list,
+        key=lambda r: (
+            str((r.get("source") or {}).get("capture_time") or ""),
+            str(r.get("event_id") or ""),
+        ),
+    )
+
+    last_pub_dt: Optional[dt.datetime] = None
+    last_species: Optional[str] = None
+    if published_list:
+        pub_sorted = sorted(
+            published_list,
+            key=lambda r: str((r.get("publication") or {}).get("published_at") or ""),
+        )
+        latest_pub = pub_sorted[-1]
+        last_species = _primary_species(latest_pub)
+        raw_pub_at = (latest_pub.get("publication") or {}).get("published_at")
+        if raw_pub_at:
+            try:
+                last_pub_dt = dt.datetime.fromisoformat(str(raw_pub_at).replace("Z", "+00:00"))
+            except Exception:
+                pass
+
+    remaining = list(ready_sorted)
+    ordered_ready: List[Dict[str, Any]] = []
+    prev_sp = last_species
+    while remaining:
+        diff_idx = next(
+            (i for i, r in enumerate(remaining) if _primary_species(r) != prev_sp),
+            0,
+        )
+        chosen = remaining.pop(diff_idx)
+        ordered_ready.append(chosen)
+        prev_sp = _primary_species(chosen)
+
+    weekdays = _parse_schedule_weekdays(schedule_days)
+    local_now = now_dt if now_dt is not None else dt.datetime.now().astimezone()
+    if local_now.tzinfo is None:
+        local_now = local_now.astimezone()
+    cursor_date = local_now.date()
+
+    slots: List[Dict[str, Any]] = []
+    slot_map: Dict[str, Dict[str, Any]] = {}
+    prev_slot_dt = last_pub_dt.astimezone(local_now.tzinfo) if last_pub_dt else None
+
+    for idx, rec in enumerate(ordered_ready):
+        while True:
+            cand_dt = dt.datetime(
+                cursor_date.year,
+                cursor_date.month,
+                cursor_date.day,
+                schedule_hour_local,
+                0,
+                0,
+                tzinfo=local_now.tzinfo,
+            )
+            is_valid_day = cursor_date.weekday() in weekdays
+            is_future_or_today_window = cand_dt >= local_now or (
+                cursor_date == local_now.date() and local_now.hour >= schedule_hour_local
+            )
+            respects_cooldown = True
+            if prev_slot_dt is not None:
+                effective_dt = max(cand_dt, local_now) if cursor_date == local_now.date() else cand_dt
+                if (effective_dt - prev_slot_dt).total_seconds() / 3600.0 < min_hours_between_posts:
+                    respects_cooldown = False
+
+            if is_valid_day and is_future_or_today_window and respects_cooldown:
+                slot_info = {
+                    "queue_position": idx + 1,
+                    "event_id": rec["event_id"],
+                    "headline": (rec.get("editorial") or {}).get("headline"),
+                    "species": _primary_species(rec),
+                    "scheduled_iso": cand_dt.isoformat(),
+                    "scheduled_label": cand_dt.strftime("%a %b %d • %H:%M").upper(),
+                }
+                slots.append(slot_info)
+                slot_map[rec["event_id"]] = slot_info
+                prev_slot_dt = cand_dt
+                cursor_date = cursor_date + dt.timedelta(days=1)
+                break
+            cursor_date = cursor_date + dt.timedelta(days=1)
+
+    return {
+        "schedule_days": schedule_days,
+        "schedule_hour_local": schedule_hour_local,
+        "min_hours_between_posts": min_hours_between_posts,
+        "ready_count": len(ordered_ready),
+        "last_published_at": last_pub_dt.isoformat() if last_pub_dt else None,
+        "last_published_species": last_species,
+        "slots": slots,
+        "slot_by_event_id": slot_map,
+    }
+
+
+def drip_publish(
+    force: bool = False,
+    dry_run: bool = False,
+    schedule_days: str = "tue,thu,sat",
+    schedule_hour_local: int = 8,
+    min_hours_between_posts: float = 36.0,
+    now_dt: Optional[dt.datetime] = None,
+    env_override: Optional[Dict[str, str]] = None,
+    repo_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """
+    Check if a scheduled publication slot (Tue / Thu / Sat) is due and publish
+    at most ONE `ready` dispatch (interleaved by species).
+    Requires zero AI tokens. Safe to invoke from cron multiple times per day.
+    """
+    sched = compute_publication_schedule(
+        schedule_days=schedule_days,
+        schedule_hour_local=schedule_hour_local,
+        min_hours_between_posts=min_hours_between_posts,
+        now_dt=now_dt,
+        env_override=env_override,
+        repo_dir=repo_dir,
+    )
+    if not sched["slots"]:
+        return {
+            "action": "skipped_empty_queue",
+            "reason": "No dispatches in `ready` state.",
+            "schedule": sched,
+        }
+
+    local_now = now_dt if now_dt is not None else dt.datetime.now().astimezone()
+    if local_now.tzinfo is None:
+        local_now = local_now.astimezone()
+    weekdays = _parse_schedule_weekdays(schedule_days)
+
+    if not force:
+        if local_now.weekday() not in weekdays:
+            return {
+                "action": "skipped_not_schedule_day",
+                "reason": f"Today ({local_now.strftime('%a')}) is not in schedule_days ({schedule_days}).",
+                "next_slot": sched["slots"][0],
+            }
+        if local_now.hour < schedule_hour_local:
+            return {
+                "action": "skipped_before_schedule_hour",
+                "reason": f"Current hour ({local_now.hour}:00) is before schedule_hour_local ({schedule_hour_local}:00).",
+                "next_slot": sched["slots"][0],
+            }
+        if sched["last_published_at"]:
+            last_dt = dt.datetime.fromisoformat(sched["last_published_at"].replace("Z", "+00:00")).astimezone()
+            elapsed_h = (local_now - last_dt).total_seconds() / 3600.0
+            if elapsed_h < min_hours_between_posts:
+                return {
+                    "action": "skipped_cooldown_active",
+                    "reason": f"Last post was {elapsed_h:.1f}h ago (< {min_hours_between_posts}h minimum spacing).",
+                    "next_slot": sched["slots"][0],
+                }
+
+    next_slot = sched["slots"][0]
+    target_eid = next_slot["event_id"]
+    published_rec = publish_dispatch(
+        target_eid,
+        dry_run=dry_run,
+        env_override=env_override,
+        repo_dir=repo_dir,
+    )
+    build_pressroom(start_server=False, env_override=env_override, repo_dir=repo_dir)
+    return {
+        "action": "published" if not dry_run else "dry_run_validated",
+        "event_id": target_eid,
+        "headline": (published_rec.get("editorial") or {}).get("headline"),
+        "remote_post_id": (published_rec.get("publication") or {}).get("remote_post_id"),
+        "remaining_ready_count": max(0, sched["ready_count"] - (0 if dry_run else 1)),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Local Web Pressroom Builder & Server
 # ---------------------------------------------------------------------------
 
@@ -2657,6 +2927,8 @@ def build_pressroom(
 
     listed = list_dispatches(env_override=env_override, repo_dir=repo_dir)
     all_dispatches = listed["dispatches"]
+    schedule_info = compute_publication_schedule(env_override=env_override, repo_dir=repo_dir)
+    slot_by_eid = schedule_info.get("slot_by_event_id") or {}
 
     state_priority = {
         "ready": 0,
@@ -2672,6 +2944,7 @@ def build_pressroom(
         all_dispatches,
         key=lambda r: (
             state_priority.get(r.get("state", "discovered"), 9),
+            (slot_by_eid.get(r.get("event_id"), {}).get("queue_position", 999) if r.get("state") == "ready" else 999),
             str(r.get("event_id", "")),
         ),
     )
@@ -2764,6 +3037,12 @@ def build_pressroom(
         badge_class = f"badge-{state}"
         synth_badge = "<span class='badge badge-synth'>SYNTHETIC FIXTURE</span>" if synthetic else ""
         char_badge = f"<span class='badge badge-char'>{char_label}</span>" if char_label else ""
+        sched_slot = slot_by_eid.get(rec.get("event_id"))
+        sched_badge = (
+            f"<span class='badge badge-sched'>SCHEDULED #{sched_slot['queue_position']}: {_html_escape(sched_slot['scheduled_label'])}</span>"
+            if (state == "ready" and sched_slot)
+            else ""
+        )
         video_badge = (
             "<span class='badge badge-video'>SLIDESHOW: COVER + 10S VIDEO</span>"
             if (video_uri and cover_uri)
@@ -2806,6 +3085,7 @@ def build_pressroom(
                 </div>
                 <div class="badges">
                   <span class="badge {badge_class}">{state.upper()}</span>
+                  {sched_badge}
                   {video_badge}
                   {synth_badge}
                   {char_badge}
@@ -2996,6 +3276,7 @@ def build_pressroom(
     .badge-synth {{ background: #6b21a8; color: #fff; }}
     .badge-char {{ background: #334155; color: #e2e8f0; }}
     .badge-video {{ background: #0284c7; color: #fff; }}
+    .badge-sched {{ background: #b45309; color: #fff; }}
     .event-id {{
       font-family: monospace;
       color: var(--muted);
@@ -3533,6 +3814,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_attach_vid.add_argument("event_id", help="Target dispatch event_id")
     p_attach_vid.add_argument("--video-event-id", default=None, help="Optional companion video event_id")
 
+    sub.add_parser(
+        "pair-companions",
+        help="Automatically pair all still-image sightings with their companion 10-second camera videos",
+    )
+
+    p_sched = sub.add_parser(
+        "schedule",
+        help="Show the upcoming Tue/Thu/Sat publication schedule for all READY dispatches",
+    )
+    p_sched.add_argument("--days", default="tue,thu,sat", help="Comma-separated weekdays (default: tue,thu,sat)")
+    p_sched.add_argument("--hour", type=int, default=8, help="Local hour of day (default: 8)")
+    p_sched.add_argument("--cooldown-hours", type=float, default=36.0, help="Minimum hours between posts (default: 36)")
+
+    p_drip = sub.add_parser(
+        "drip-publish",
+        help="Publish at most one READY dispatch if today is a scheduled day (Tue/Thu/Sat) and cooldown elapsed",
+    )
+    p_drip.add_argument("--force", action="store_true", help="Publish next READY dispatch immediately regardless of day/cooldown")
+    p_drip.add_argument("--dry-run", action="store_true", help="Validate without posting to Instagram")
+    p_drip.add_argument("--days", default="tue,thu,sat", help="Comma-separated weekdays (default: tue,thu,sat)")
+    p_drip.add_argument("--hour", type=int, default=8, help="Local hour of day (default: 8)")
+    p_drip.add_argument("--cooldown-hours", type=float, default=36.0, help="Minimum hours between posts (default: 36)")
+
     p_synth = sub.add_parser(
         "init-synthetic-demo",
         help="Create a 3-sighting synthetic test selection (1 ready story, 1 privacy hold, 1 empty-frame hold)",
@@ -3559,6 +3863,35 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "attach-video":
         res = attach_video_to_dispatch(args.event_id, video_event_id=args.video_event_id)
         print(json.dumps(res, indent=2))
+        return 0
+    if args.command == "pair-companions":
+        print(json.dumps(pair_all_photo_video_companions(), indent=2))
+        return 0
+    if args.command == "schedule":
+        print(
+            json.dumps(
+                compute_publication_schedule(
+                    schedule_days=args.days,
+                    schedule_hour_local=args.hour,
+                    min_hours_between_posts=args.cooldown_hours,
+                ),
+                indent=2,
+            )
+        )
+        return 0
+    if args.command == "drip-publish":
+        print(
+            json.dumps(
+                drip_publish(
+                    force=args.force,
+                    dry_run=args.dry_run,
+                    schedule_days=args.days,
+                    schedule_hour_local=args.hour,
+                    min_hours_between_posts=args.cooldown_hours,
+                ),
+                indent=2,
+            )
+        )
         return 0
     if args.command == "init-synthetic-demo":
         synth = create_synthetic_test_selection()

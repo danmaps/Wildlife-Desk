@@ -455,3 +455,83 @@ def test_attach_video_and_pressroom_video_playback(tmp_path: Path):
     assert f"media/{img_eid}-video.mp4" in html_text
     assert "<video" in html_text
 
+
+def test_schedule_interleaving_and_drip_publish(tmp_path: Path):
+    """
+    Verify that `compute_publication_schedule` interleaves species across Tue/Thu/Sat
+    slots and `drip_publish` respects schedule days and cooldown windows.
+    """
+    import datetime as dt
+
+    env = _make_test_env(tmp_path)
+    sel_dir = Path(env["LOCAL_WILDLIFE_DIR"])
+    items = [
+        ("C1.jpg", (30, 40, 50), "2026-11-01T01:00:00", "coyote", "COYOTE PATROLS RIDGE AT ONE IN THE MORNING"),
+        ("C2.jpg", (45, 55, 65), "2026-11-01T02:00:00", "coyote", "COYOTE CROSSES HILLSIDE IN QUIET DARKNESS"),
+        ("R1.jpg", (60, 70, 80), "2026-11-01T03:00:00", "raccoon", "RACCOON INSPECTS PERIMETER MARKER AFTER DARK"),
+    ]
+    for fname, col, cap_time, _, _ in items:
+        _create_image_with_meta(
+            sel_dir, fname, color=col, capture_time=cap_time, tz_known=False
+        )
+
+    disc = wildlife_desk.discover_sightings(env_override=env)
+    assert disc["total_sightings"] == 3
+
+    for s_info, (_, _, _, sp, headline) in zip(disc["sightings"], items):
+        eid = s_info["event_id"]
+        rec = wildlife_desk.load_dispatch_record(eid, env_override=env)
+        wildlife_desk.record_observations(
+            event_id=eid,
+            observations=[
+                {
+                    "claim": f"One {sp} is visible in infrared mode.",
+                    "source_asset_ids": rec["source"]["asset_ids"],
+                    "species": sp,
+                    "certainty": "confirmed",
+                }
+            ],
+            contains_people=False,
+            contains_identifying_property=False,
+            env_override=env,
+        )
+        wildlife_desk.draft_dispatch(
+            event_id=eid,
+            headline=headline,
+            caption=f"A {sp} crossed the clearing during overnight camera monitoring.",
+            section="The Night Shift",
+            env_override=env,
+        )
+
+    # Monday Nov 2, 2026 @ 10:00 local
+    mon_dt = dt.datetime(2026, 11, 2, 10, 0, 0, tzinfo=dt.timezone.utc)
+    sched = wildlife_desk.compute_publication_schedule(
+        schedule_days="tue,thu,sat",
+        schedule_hour_local=8,
+        now_dt=mon_dt,
+        env_override=env,
+    )
+    assert sched["ready_count"] == 3
+    # Species should interleave: coyote -> raccoon -> coyote
+    species_order = [s["species"] for s in sched["slots"]]
+    assert species_order == ["coyote", "raccoon", "coyote"]
+
+    # Calling drip_publish on Monday should skip (not a Tue/Thu/Sat schedule day)
+    skip_res = wildlife_desk.drip_publish(
+        now_dt=mon_dt,
+        dry_run=True,
+        env_override=env,
+    )
+    assert skip_res["action"] == "skipped_not_schedule_day"
+
+    # Calling drip_publish on Tuesday Nov 3 @ 08:05 should dry-run publish slot #1
+    tue_dt = dt.datetime(2026, 11, 3, 8, 5, 0, tzinfo=dt.timezone.utc)
+    pub_res = wildlife_desk.drip_publish(
+        now_dt=tue_dt,
+        dry_run=True,
+        env_override=env,
+    )
+    assert pub_res["action"] == "dry_run_validated"
+    assert pub_res["event_id"] == sched["slots"][0]["event_id"]
+
+

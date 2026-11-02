@@ -66,3 +66,8 @@ When acting as the user's **Reporter and Social Media Manager**, you run the edi
 1. View the rendered cover (`output/<event_id>/cover-1080x1350.jpg`) and 1:1 grid crop (`output/<event_id>/crop-preview-1080x1080.jpg`) with your image viewer tool to verify that the headline is crisp and does not obscure the animal's face.
    - If the text overlaps the subject, call `render_dispatch_cover(event_id, layout_position="top-left" | "bottom-right", crop_focus_x=..., crop_focus_y=...)`.
 2. Call `build_pressroom(start_server=True)` to compile `output/pressroom/index.html` and serve the interactive Local Web Pressroom at `http://localhost:8766/`.
+
+### Step 6: Automated Batch Intake & Multi-Week Drip Publishing (`pair-companions`, `schedule`, `drip-publish`)
+1. Call `pair_all_photo_video_companions()` (CLI: `python3 scripts/wildlife_desk.py pair-companions`) to automatically pair all Photo + 10s Video captures (`0 <= delta <= 25s`) into 2-slide Carousel dispatches and hide standalone companion video records from the queue.
+2. Call `compute_publication_schedule()` (CLI: `python3 scripts/wildlife_desk.py schedule`) to inspect the multi-week `Tue / Thu / Sat @ 08:00` publication calendar with species interleaving.
+3. Call `drip_publish()` (CLI: `python3 scripts/wildlife_desk.py drip-publish`) from cron (`scripts/cron_runner.sh`) to publish at most one `ready` dispatch per scheduled morning slot (`>= 36h` cooldown between posts) and trigger headless agent curation only when new `discovered` captures arrive.
