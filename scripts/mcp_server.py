@@ -229,6 +229,24 @@ def render_dispatch_cover(
 
 
 @mcp.tool()
+def attach_video_to_dispatch(
+    event_id: str,
+    video_event_id: Optional[str] = None,
+) -> str:
+    """
+    Configure a dispatch as a 2-slide Carousel post (Slide 1: Marked-up 1080x1350 cover image,
+    Slide 2: 10-second camera video).
+    If `event_id` is a still-image sighting, pairs it with `video_event_id` (or auto-detects the
+    companion 10-second camera video captured immediately after the photo) and caches the `.mp4`.
+    """
+    return _safe_json_response(
+        wildlife_desk.attach_video_to_dispatch,
+        event_id=event_id,
+        video_event_id=video_event_id,
+    )
+
+
+@mcp.tool()
 def hold_dispatch(
     event_id: str,
     reason: str,

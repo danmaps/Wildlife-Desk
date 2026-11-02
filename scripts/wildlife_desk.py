@@ -765,6 +765,31 @@ def download_immich_asset_to_cache(
         tmp_path.unlink(missing_ok=True)
 
 
+def download_immich_video_to_cache(
+    config: Dict[str, Any], immich_raw_id: str, dest_path: Path
+) -> Path:
+    """Download an approved Immich video asset into the local media cache."""
+    validate_selection_boundary(config)
+    base_url = config["immich_base_url"]
+    api_key = config["immich_api_key"]
+    url = f"{base_url}/api/assets/{urllib.parse.quote(immich_raw_id)}/original"
+    req = urllib.request.Request(
+        url,
+        headers={"x-api-key": api_key, "Accept": "application/octet-stream"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw_bytes = resp.read()
+    except Exception as exc:
+        safe_msg = redact_secrets(str(exc), config)
+        raise WildlifeDeskError(f"Failed to download Immich video {immich_raw_id}: {safe_msg}") from exc
+
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    dest_path.write_bytes(raw_bytes)
+    return dest_path
+
+
 # ---------------------------------------------------------------------------
 # Conservative Burst Grouping & Sighting Discovery
 # ---------------------------------------------------------------------------
@@ -876,6 +901,7 @@ def discover_sightings(
         event_cache_dir.mkdir(parents=True, exist_ok=True)
 
         cached_files: Dict[str, str] = {}
+        cached_videos: Dict[str, str] = {}
         for asset in group:
             aid = asset["asset_id"]
             dest_file = event_cache_dir / f"{aid}.jpg"
@@ -889,8 +915,26 @@ def discover_sightings(
             if dest_file.exists():
                 cached_files[aid] = str(dest_file)
 
+            if asset.get("media_type") == "video":
+                dest_vid = event_cache_dir / f"{aid}.mp4"
+                if not dest_vid.exists():
+                    if boundary["mode"] == "local" and asset.get("local_source_path"):
+                        shutil.copyfile(Path(asset["local_source_path"]), dest_vid)
+                    elif boundary["mode"] == "immich" and asset.get("immich_raw_id"):
+                        download_immich_video_to_cache(config, asset["immich_raw_id"], dest_vid)
+                if dest_vid.exists():
+                    cached_videos[aid] = str(dest_vid)
+
         if dispatch_path.exists():
             record = json.loads(dispatch_path.read_text(encoding="utf-8"))
+            updated_existing = False
+            for a_rec in record.get("source", {}).get("assets", []):
+                aid = a_rec.get("asset_id")
+                if aid in cached_videos and not a_rec.get("cached_video_path"):
+                    a_rec["cached_video_path"] = cached_videos[aid]
+                    updated_existing = True
+            if updated_existing:
+                _save_dispatch_record(dispatch_path, record, config)
             existing_ids.append(event_id)
         else:
             first = group[0]
@@ -903,7 +947,7 @@ def discover_sightings(
             )
 
             default_uncertainties: List[str] = []
-            if len(group) == 1:
+            if len(group) == 1 and first.get("media_type") != "video":
                 default_uncertainties.append(
                     "A single still image cannot establish duration, direction of travel, or events before and after the frame."
                 )
@@ -940,6 +984,7 @@ def discover_sightings(
                             "capture_time_provenance": a["capture_time_provenance"],
                             "import_time": a["import_time"],
                             "cached_preview_path": cached_files.get(a["asset_id"]),
+                            "cached_video_path": cached_videos.get(a["asset_id"]),
                         }
                         for a in group
                     ],
@@ -1826,10 +1871,22 @@ def render_dispatch_cover(
 
     output_sha256 = hashlib.sha256(cover_path.read_bytes()).hexdigest()
 
+    prev_prod = record.get("production") or {}
+    video_path = prev_prod.get("video_path")
+    if not video_path:
+        for asset in record["source"].get("assets", []):
+            if asset.get("media_type") == "video":
+                cand_vid = asset.get("cached_video_path")
+                if cand_vid and Path(cand_vid).exists():
+                    video_path = str(cand_vid)
+                    break
+
     record["production"] = {
         "cover_path": str(cover_path),
         "square_preview_path": str(square_path),
         "thumb_preview_path": str(thumb_path),
+        "video_path": video_path,
+        "post_format": "carousel_video" if video_path else "single_image",
         "layout_position": pos,
         "crop_focus_x": fx,
         "crop_focus_y": fy,
@@ -1846,6 +1903,182 @@ def render_dispatch_cover(
         record["state"] = "ready"
     elif record["eligibility"]["privacy_check"] != "passed" or record["eligibility"]["factual_support_check"] != "passed":
         record["state"] = "held"
+
+    _save_dispatch_record(dispatch_path, record, config)
+    return record
+
+
+# ---------------------------------------------------------------------------
+# Video Caching & Slideshow (Photo Cover + 10s Camera Video) Pairing
+# ---------------------------------------------------------------------------
+
+
+def ensure_event_video_cached(
+    event_id: str,
+    env_override: Optional[Dict[str, str]] = None,
+    repo_dir: Optional[Path] = None,
+) -> Optional[Path]:
+    """
+    Ensure any video asset associated with `event_id` has its `.mp4` downloaded
+    into `state/media_cache/<event_id>/<asset_id>.mp4` and recorded on the dispatch.
+    """
+    config = load_config(env_override=env_override, repo_dir=repo_dir)
+    dirs = ensure_runtime_dirs(config)
+    dispatch_path = dirs["dispatches"] / f"{event_id}.json"
+    record = load_dispatch_record(event_id, env_override=env_override, repo_dir=repo_dir)
+    event_cache_dir = dirs["media_cache"] / event_id
+    event_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    found_video: Optional[Path] = None
+    updated = False
+    for asset in record.get("source", {}).get("assets", []):
+        if asset.get("media_type") != "video":
+            continue
+        aid = str(asset.get("asset_id") or "")
+        existing = asset.get("cached_video_path")
+        if existing and Path(existing).exists():
+            found_video = Path(existing)
+            break
+        dest_vid = event_cache_dir / f"{aid}.mp4"
+        if not dest_vid.exists():
+            if aid.startswith("immich-"):
+                raw_id = aid[len("immich-") :]
+                download_immich_video_to_cache(config, raw_id, dest_vid)
+            elif record["source"].get("selection_mode") == "local" and config.get("local_wildlife_dir"):
+                src_file = Path(config["local_wildlife_dir"]) / str(asset.get("filename") or "")
+                if src_file.exists():
+                    shutil.copyfile(src_file, dest_vid)
+        if dest_vid.exists():
+            asset["cached_video_path"] = str(dest_vid)
+            found_video = dest_vid
+            updated = True
+            break
+
+    if found_video:
+        prod = record.setdefault("production", {})
+        if prod.get("video_path") != str(found_video) or prod.get("post_format") != "carousel_video":
+            prod["video_path"] = str(found_video)
+            prod["post_format"] = "carousel_video"
+            updated = True
+
+    if updated:
+        _save_dispatch_record(dispatch_path, record, config)
+    return found_video
+
+
+def find_companion_video_event(
+    event_id: str,
+    max_delta_seconds: float = 25.0,
+    env_override: Optional[Dict[str, str]] = None,
+    repo_dir: Optional[Path] = None,
+) -> Optional[str]:
+    """
+    Find the companion 10-second camera video event (`evt-*`) that immediately follows
+    a still-image event from a trail camera operating in Photo + Video mode.
+    """
+    record = load_dispatch_record(event_id, env_override=env_override, repo_dir=repo_dir)
+    src_time = (record.get("source") or {}).get("capture_time")
+    if not src_time:
+        return None
+    _, _, base_epoch = _parse_exif_datetime(str(src_time))
+    if base_epoch is None:
+        return None
+
+    all_dispatches = list_dispatches(env_override=env_override, repo_dir=repo_dir)["dispatches"]
+    best_eid: Optional[str] = None
+    best_delta = float("inf")
+    for cand in all_dispatches:
+        cid = cand.get("event_id")
+        if cid == event_id:
+            continue
+        c_assets = (cand.get("source") or {}).get("assets") or []
+        if not c_assets or c_assets[0].get("media_type") != "video":
+            continue
+        c_time = (cand.get("source") or {}).get("capture_time")
+        if not c_time:
+            continue
+        _, _, c_epoch = _parse_exif_datetime(str(c_time))
+        if c_epoch is None:
+            continue
+        delta = c_epoch - base_epoch
+        if -2.0 <= delta <= max_delta_seconds and abs(delta) < best_delta:
+            best_delta = abs(delta)
+            best_eid = cid
+    return best_eid
+
+
+def attach_video_to_dispatch(
+    event_id: str,
+    video_event_id: Optional[str] = None,
+    env_override: Optional[Dict[str, str]] = None,
+    repo_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """
+    Configure a dispatch as a 2-slide Carousel post (Slide 1: Marked-up 1080x1350 cover image,
+    Slide 2: 10-second camera video).
+    - If `event_id` is already a video event, caches its `.mp4` and sets `post_format="carousel_video"`.
+    - If `event_id` is a still-image event, pairs it with `video_event_id` (or auto-detects the
+      companion camera video via `find_companion_video_event`), caches the `.mp4`, adds the video
+      asset to `source.assets`, and sets `production.video_path`.
+    """
+    config = load_config(env_override=env_override, repo_dir=repo_dir)
+    dirs = ensure_runtime_dirs(config)
+    dispatch_path = dirs["dispatches"] / f"{event_id}.json"
+    record = load_dispatch_record(event_id, env_override=env_override, repo_dir=repo_dir)
+
+    # Case 1: event already has a video asset
+    existing_vid = ensure_event_video_cached(event_id, env_override=env_override, repo_dir=repo_dir)
+    if existing_vid and not video_event_id:
+        return load_dispatch_record(event_id, env_override=env_override, repo_dir=repo_dir)
+
+    # Case 2: pair with companion video event
+    resolved_vid_eid = video_event_id or find_companion_video_event(
+        event_id, env_override=env_override, repo_dir=repo_dir
+    )
+    if not resolved_vid_eid:
+        raise WildlifeDeskError(
+            f"No video asset or companion video event found for {event_id}. Pass `video_event_id` explicitly."
+        )
+
+    vid_path = ensure_event_video_cached(resolved_vid_eid, env_override=env_override, repo_dir=repo_dir)
+    if not vid_path or not vid_path.exists():
+        raise WildlifeDeskError(f"Failed to cache video file from companion event {resolved_vid_eid}.")
+
+    vid_record = load_dispatch_record(resolved_vid_eid, env_override=env_override, repo_dir=repo_dir)
+    vid_assets = [a for a in (vid_record.get("source") or {}).get("assets", []) if a.get("media_type") == "video"]
+    if not vid_assets:
+        raise WildlifeDeskError(f"Companion event {resolved_vid_eid} does not contain a video asset.")
+
+    vid_asset = dict(vid_assets[0])
+    event_cache_dir = dirs["media_cache"] / event_id
+    event_cache_dir.mkdir(parents=True, exist_ok=True)
+    local_vid_copy = event_cache_dir / f"{vid_asset['asset_id']}.mp4"
+    if not local_vid_copy.exists():
+        try:
+            os.link(vid_path, local_vid_copy)
+        except Exception:
+            shutil.copyfile(vid_path, local_vid_copy)
+    vid_asset["cached_video_path"] = str(local_vid_copy)
+
+    src = record.setdefault("source", {})
+    asset_ids = src.setdefault("asset_ids", [])
+    if vid_asset["asset_id"] not in asset_ids:
+        asset_ids.append(vid_asset["asset_id"])
+    assets_list = src.setdefault("assets", [])
+    if not any(a.get("asset_id") == vid_asset["asset_id"] for a in assets_list):
+        assets_list.append(vid_asset)
+    src["companion_video_event_id"] = resolved_vid_eid
+
+    prod = record.setdefault("production", {})
+    prod["video_path"] = str(local_vid_copy)
+    prod["post_format"] = "carousel_video"
+
+    # Remove single-still-only default uncertainty if present
+    record["uncertainties"] = [
+        u
+        for u in (record.get("uncertainties") or [])
+        if "single still image cannot establish duration" not in u
+    ]
 
     _save_dispatch_record(dispatch_path, record, config)
     return record
@@ -2023,6 +2256,16 @@ def publish_dispatch(
             )
 
         cover_path = Path(record["production"]["cover_path"])
+        video_path_str = record["production"].get("video_path")
+        video_path: Optional[Path] = (
+            Path(video_path_str) if video_path_str and Path(video_path_str).exists() else None
+        )
+        if video_path is None:
+            # Check if event has a video asset in source.assets
+            video_path = ensure_event_video_cached(event_id, env_override=env_override, repo_dir=repo_dir)
+            if video_path:
+                record = load_dispatch_record(event_id, env_override=env_override, repo_dir=repo_dir)
+
         stage_dir = Path(stage_dir_raw).expanduser().resolve()
         stage_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -2033,6 +2276,13 @@ def publish_dispatch(
         staged_filename = f"wd-{ephemeral_token}.jpg"
         staged_file_path = stage_dir / staged_filename
         public_image_url = f"{stage_base_url}/{staged_filename}"
+
+        staged_video_path: Optional[Path] = None
+        public_video_url: Optional[str] = None
+        if video_path and video_path.exists():
+            staged_video_filename = f"wd-{ephemeral_token}-clip.mp4"
+            staged_video_path = stage_dir / staged_video_filename
+            public_video_url = f"{stage_base_url}/{staged_video_filename}"
 
         # Determine Graph host based on token type (IG... -> graph.instagram.com, EAA... -> graph.facebook.com)
         graph_host = (
@@ -2045,16 +2295,18 @@ def publish_dispatch(
 
         shutil.copyfile(cover_path, staged_file_path)
         os.chmod(staged_file_path, 0o644)
-        try:
-            # Phase A: Create Media Container
+        if staged_video_path and video_path:
+            shutil.copyfile(video_path, staged_video_path)
+            os.chmod(staged_video_path, 0o644)
+
+        def _create_and_wait_container(
+            payload_dict: Dict[str, str],
+            step_label: str,
+            max_polls: int = 20,
+            poll_interval: float = 2.0,
+        ) -> str:
             container_url = f"{graph_host}/{urllib.parse.quote(target_id)}/media"
-            container_payload = urllib.parse.urlencode(
-                {
-                    "image_url": public_image_url,
-                    "caption": caption_text,
-                    "access_token": ig_token,
-                }
-            ).encode("utf-8")
+            container_payload = urllib.parse.urlencode(payload_dict).encode("utf-8")
             c_req = urllib.request.Request(
                 container_url,
                 data=container_payload,
@@ -2076,6 +2328,7 @@ def publish_dispatch(
                     {
                         "attempted_at": attempt_time,
                         "publication_key": pub_key,
+                        "step": step_label,
                         "outcome": "container_creation_failed",
                         "error": safe_err,
                     }
@@ -2083,18 +2336,17 @@ def publish_dispatch(
                 record["publication"] = pub
                 record["state"] = "failed"
                 _save_dispatch_record(dispatch_path, record, config)
-                raise PublicationGateError(f"Instagram container creation failed: {safe_err}") from exc
+                raise PublicationGateError(f"Instagram container creation ({step_label}) failed: {safe_err}") from exc
 
-            creation_id = str(c_data.get("id") or "").strip()
-            if not creation_id:
-                raise PublicationGateError("Instagram API did not return a creation_id for media container.")
+            cid = str(c_data.get("id") or "").strip()
+            if not cid:
+                raise PublicationGateError(f"Instagram API did not return a creation_id for {step_label}.")
 
-            # Poll container status briefly until FINISHED (up to 15 seconds)
             status_url = (
-                f"{graph_host}/{urllib.parse.quote(creation_id)}"
+                f"{graph_host}/{urllib.parse.quote(cid)}"
                 f"?fields=status_code,status&access_token={urllib.parse.quote(ig_token)}"
             )
-            for _ in range(10):
+            for _ in range(max_polls):
                 try:
                     with urllib.request.urlopen(status_url, timeout=10) as st_resp:
                         st_data = json.loads(st_resp.read().decode("utf-8"))
@@ -2102,14 +2354,79 @@ def publish_dispatch(
                     if st_code in ("FINISHED", ""):
                         break
                     if st_code in ("ERROR", "EXPIRED"):
-                        raise PublicationGateError(f"Instagram container {creation_id} failed with status: {st_data}")
+                        safe_st = redact_secrets(json.dumps(st_data), config)
+                        pub.setdefault("attempts", []).append(
+                            {
+                                "attempted_at": attempt_time,
+                                "publication_key": pub_key,
+                                "step": step_label,
+                                "creation_id": cid,
+                                "outcome": "container_processing_error",
+                                "error": safe_st,
+                            }
+                        )
+                        record["publication"] = pub
+                        record["state"] = "failed"
+                        _save_dispatch_record(dispatch_path, record, config)
+                        raise PublicationGateError(f"Instagram container {cid} ({step_label}) failed: {safe_st}")
                 except PublicationGateError:
                     raise
                 except Exception:
                     pass
-                time.sleep(1.5)
+                time.sleep(poll_interval)
+            return cid
 
-            # Phase B: Publish Media Container
+        try:
+            children_ids: List[str] = []
+            if public_video_url and staged_video_path:
+                # 2-Slide Carousel Post: Slide 1 = Marked-up Cover Image, Slide 2 = 10s Camera Video
+                child_img_id = _create_and_wait_container(
+                    {
+                        "image_url": public_image_url,
+                        "is_carousel_item": "true",
+                        "access_token": ig_token,
+                    },
+                    step_label="carousel_slide_1_image",
+                    max_polls=15,
+                    poll_interval=1.5,
+                )
+                child_vid_id = _create_and_wait_container(
+                    {
+                        "media_type": "VIDEO",
+                        "video_url": public_video_url,
+                        "is_carousel_item": "true",
+                        "access_token": ig_token,
+                    },
+                    step_label="carousel_slide_2_video",
+                    max_polls=45,
+                    poll_interval=2.5,
+                )
+                children_ids = [child_img_id, child_vid_id]
+                creation_id = _create_and_wait_container(
+                    {
+                        "media_type": "CAROUSEL",
+                        "children": f"{child_img_id},{child_vid_id}",
+                        "caption": caption_text,
+                        "access_token": ig_token,
+                    },
+                    step_label="carousel_parent",
+                    max_polls=25,
+                    poll_interval=2.0,
+                )
+            else:
+                # Single-Image Post
+                creation_id = _create_and_wait_container(
+                    {
+                        "image_url": public_image_url,
+                        "caption": caption_text,
+                        "access_token": ig_token,
+                    },
+                    step_label="single_image",
+                    max_polls=15,
+                    poll_interval=1.5,
+                )
+
+            # Phase B: Publish Media Container (with brief retry if carousel finalization lags by 1-2s)
             publish_url = f"{graph_host}/{urllib.parse.quote(target_id)}/media_publish"
             publish_payload = urllib.parse.urlencode(
                 {
@@ -2117,59 +2434,90 @@ def publish_dispatch(
                     "access_token": ig_token,
                 }
             ).encode("utf-8")
-            p_req = urllib.request.Request(
-                publish_url,
-                data=publish_payload,
-                headers={"Accept": "application/json"},
-                method="POST",
-            )
-            try:
-                with urllib.request.urlopen(p_req, timeout=30) as p_resp:
-                    p_data = json.loads(p_resp.read().decode("utf-8"))
-            except (TimeoutError, socket.timeout, urllib.error.URLError) as exc:
-                safe_err = redact_secrets(str(exc), config)
-                pub.setdefault("attempts", []).append(
-                    {
-                        "attempted_at": attempt_time,
-                        "publication_key": pub_key,
-                        "creation_id": creation_id,
-                        "outcome": "timeout_unknown_remote_state",
-                        "error": safe_err,
-                    }
+            p_data: Dict[str, Any] = {}
+            for pub_try in range(4):
+                p_req = urllib.request.Request(
+                    publish_url,
+                    data=publish_payload,
+                    headers={"Accept": "application/json"},
+                    method="POST",
                 )
-                pub["reconcile_required"] = True
-                record["publication"] = pub
-                record["state"] = "failed"
-                _save_dispatch_record(dispatch_path, record, config)
-                raise PublicationGateError(
-                    f"Instagram media_publish timed out after submission (`reconcile_required=True`): {safe_err}"
-                ) from exc
-            except Exception as exc:
-                safe_err = redact_secrets(str(exc), config)
-                pub.setdefault("attempts", []).append(
-                    {
-                        "attempted_at": attempt_time,
-                        "publication_key": pub_key,
-                        "creation_id": creation_id,
-                        "outcome": "publish_failed",
-                        "error": safe_err,
-                    }
-                )
-                record["publication"] = pub
-                record["state"] = "failed"
-                _save_dispatch_record(dispatch_path, record, config)
-                raise PublicationGateError(f"Instagram media_publish failed: {safe_err}") from exc
+                try:
+                    with urllib.request.urlopen(p_req, timeout=30) as p_resp:
+                        p_data = json.loads(p_resp.read().decode("utf-8"))
+                    break
+                except urllib.error.HTTPError as exc:
+                    err_body = ""
+                    try:
+                        err_body = exc.read().decode("utf-8", errors="replace")
+                    except Exception:
+                        pass
+                    if pub_try < 3 and ("2207027" in err_body or "9007" in err_body or "not ready" in err_body.lower()):
+                        time.sleep(3.0)
+                        continue
+                    safe_err = redact_secrets(f"{exc.code} {err_body}", config)
+                    pub.setdefault("attempts", []).append(
+                        {
+                            "attempted_at": attempt_time,
+                            "publication_key": pub_key,
+                            "creation_id": creation_id,
+                            "outcome": "publish_failed",
+                            "error": safe_err,
+                        }
+                    )
+                    record["publication"] = pub
+                    record["state"] = "failed"
+                    _save_dispatch_record(dispatch_path, record, config)
+                    raise PublicationGateError(f"Instagram media_publish failed: {safe_err}") from exc
+                except (TimeoutError, socket.timeout, urllib.error.URLError) as exc:
+                    safe_err = redact_secrets(str(exc), config)
+                    pub.setdefault("attempts", []).append(
+                        {
+                            "attempted_at": attempt_time,
+                            "publication_key": pub_key,
+                            "creation_id": creation_id,
+                            "outcome": "timeout_unknown_remote_state",
+                            "error": safe_err,
+                        }
+                    )
+                    pub["reconcile_required"] = True
+                    record["publication"] = pub
+                    record["state"] = "failed"
+                    _save_dispatch_record(dispatch_path, record, config)
+                    raise PublicationGateError(
+                        f"Instagram media_publish timed out after submission (`reconcile_required=True`): {safe_err}"
+                    ) from exc
+                except Exception as exc:
+                    safe_err = redact_secrets(str(exc), config)
+                    pub.setdefault("attempts", []).append(
+                        {
+                            "attempted_at": attempt_time,
+                            "publication_key": pub_key,
+                            "creation_id": creation_id,
+                            "outcome": "publish_failed",
+                            "error": safe_err,
+                        }
+                    )
+                    record["publication"] = pub
+                    record["state"] = "failed"
+                    _save_dispatch_record(dispatch_path, record, config)
+                    raise PublicationGateError(f"Instagram media_publish failed: {safe_err}") from exc
 
             remote_id = str(p_data.get("id") or "").strip()
             published_at = dt.datetime.now(dt.timezone.utc).isoformat()
             pub["remote_post_id"] = remote_id
             pub["published_at"] = published_at
+            pub["post_type"] = "CAROUSEL" if children_ids else "IMAGE"
+            if children_ids:
+                pub["children_ids"] = children_ids
             pub["reconcile_required"] = False
             pub.setdefault("attempts", []).append(
                 {
                     "attempted_at": attempt_time,
                     "publication_key": pub_key,
                     "creation_id": creation_id,
+                    "children_ids": children_ids,
+                    "post_type": pub["post_type"],
                     "outcome": "published",
                     "remote_post_id": remote_id,
                 }
@@ -2185,6 +2533,8 @@ def publish_dispatch(
                         "event_id": event_id,
                         "publication_key": pub_key,
                         "creation_id": creation_id,
+                        "children_ids": children_ids,
+                        "post_type": pub["post_type"],
                         "remote_post_id": remote_id,
                         "published_at": published_at,
                         "cover_sha256": record["production"].get("output_sha256"),
@@ -2196,8 +2546,10 @@ def publish_dispatch(
             )
             return record
         finally:
-            # Promptly expire the temporary public derivative file
+            # Promptly expire temporary public derivative files
             staged_file_path.unlink(missing_ok=True)
+            if staged_video_path:
+                staged_video_path.unlink(missing_ok=True)
     finally:
         lock_path.unlink(missing_ok=True)
 
@@ -2268,7 +2620,11 @@ def _copy_pressroom_media(src_path_str: Optional[str], media_dir: Path, dest_nam
     media_dir.mkdir(parents=True, exist_ok=True)
     dest = media_dir / dest_name
     if not dest.exists() or p.stat().st_mtime > dest.stat().st_mtime:
-        shutil.copyfile(p, dest)
+        dest.unlink(missing_ok=True)
+        try:
+            os.link(p, dest)
+        except Exception:
+            shutil.copyfile(p, dest)
     return f"media/{dest_name}"
 
 
@@ -2292,7 +2648,7 @@ def build_pressroom(
     """
     Build the Local Web Pressroom (`output/pressroom/index.html`)
     for reviewing front-page covers, 1:1 profile crops, thumbnails, raw burst frames,
-    Instagram captions, and the factual/privacy evidence ledger.
+    10-second camera videos, Instagram captions, and the factual/privacy evidence ledger.
     """
     config = load_config(env_override=env_override, repo_dir=repo_dir)
     dirs = ensure_runtime_dirs(config)
@@ -2348,13 +2704,36 @@ def build_pressroom(
             else None
         )
 
+        video_src_path = prod.get("video_path")
+        if not video_src_path:
+            for a_item in raw_assets:
+                if a_item.get("media_type") == "video":
+                    cand_v = a_item.get("cached_video_path")
+                    if not cand_v:
+                        fallback_v = dirs["media_cache"] / str(rec.get("event_id")) / f"{a_item.get('asset_id')}.mp4"
+                        if fallback_v.exists():
+                            cand_v = str(fallback_v)
+                    if cand_v and Path(cand_v).exists():
+                        video_src_path = str(cand_v)
+                        break
+        video_uri = _copy_pressroom_media(video_src_path, press_media_dir, f"{eid}-video.mp4")
+
         if state == "discovered":
             fname = _html_escape(raw_assets[0].get("filename") if raw_assets else eid)
             mtype = _html_escape(raw_assets[0].get("media_type", "image").upper() if raw_assets else "IMAGE")
+            if video_uri:
+                media_el = (
+                    f'<video controls playsinline preload="none" '
+                    f'poster="{raw_uri or ""}" src="{video_uri}"></video>'
+                )
+            elif raw_uri:
+                media_el = f'<img loading="lazy" src="{raw_uri}" alt="{fname}" />'
+            else:
+                media_el = ""
             wire_cards_html.append(
                 f"""
                 <div class="wire-item">
-                  {f'<img loading="lazy" src="{raw_uri}" alt="{fname}" />' if raw_uri else ''}
+                  {media_el}
                   <div class="wire-meta">
                     <strong>{eid}</strong> <span>[{mtype}] {fname}</span>
                   </div>
@@ -2385,11 +2764,23 @@ def build_pressroom(
         badge_class = f"badge-{state}"
         synth_badge = "<span class='badge badge-synth'>SYNTHETIC FIXTURE</span>" if synthetic else ""
         char_badge = f"<span class='badge badge-char'>{char_label}</span>" if char_label else ""
+        video_badge = (
+            "<span class='badge badge-video'>SLIDESHOW: COVER + 10S VIDEO</span>"
+            if (video_uri and cover_uri)
+            else ("<span class='badge badge-video'>VIDEO CLIP</span>" if video_uri else "")
+        )
 
         view_buttons = []
         if cover_uri:
+            slide1_label = "Slide 1: 4:5 Cover (1080×1350)" if video_uri else "4:5 Cover (1080×1350)"
             view_buttons.append(
-                f"<button class='tab-btn active' onclick=\"switchView('{eid}', 'cover')\">4:5 Cover (1080×1350)</button>"
+                f"<button class='tab-btn active' onclick=\"switchView('{eid}', 'cover')\">{slide1_label}</button>"
+            )
+        if video_uri:
+            vid_active_cls = " active" if not cover_uri else ""
+            vid_label = "▶ Slide 2: 10s Camera Video" if cover_uri else "▶ 10s Camera Video"
+            view_buttons.append(
+                f"<button class='tab-btn{vid_active_cls}' onclick=\"switchView('{eid}', 'video')\">{vid_label}</button>"
             )
         if square_uri:
             view_buttons.append(
@@ -2400,7 +2791,7 @@ def build_pressroom(
                 f"<button class='tab-btn' onclick=\"switchView('{eid}', 'thumb')\">Small Thumbnail</button>"
             )
         if raw_uri:
-            active_cls = " active" if not cover_uri else ""
+            active_cls = " active" if (not cover_uri and not video_uri) else ""
             view_buttons.append(
                 f"<button class='tab-btn{active_cls}' onclick=\"switchView('{eid}', 'raw')\">Raw Camera Frame</button>"
             )
@@ -2415,6 +2806,7 @@ def build_pressroom(
                 </div>
                 <div class="badges">
                   <span class="badge {badge_class}">{state.upper()}</span>
+                  {video_badge}
                   {synth_badge}
                   {char_badge}
                   <span class="event-id">{eid}</span>
@@ -2426,12 +2818,14 @@ def build_pressroom(
                   <div class="view-tabs">{''.join(view_buttons)}</div>
                   <div class="frame-stage">
                     {f'<img id="img-{eid}-cover" class="stage-img visible" src="{cover_uri}" alt="Rendered Cover" />' if cover_uri else ''}
+                    {f'<video id="img-{eid}-video" class="stage-img stage-video {"visible" if not cover_uri else ""}" controls playsinline preload="metadata" poster="{raw_uri or cover_uri or ""}" src="{video_uri}"></video>' if video_uri else ''}
                     {f'<img id="img-{eid}-square" class="stage-img" src="{square_uri}" alt="1:1 Profile Crop" />' if square_uri else ''}
                     {f'<img id="img-{eid}-thumb" class="stage-img thumb-size" src="{thumb_uri}" alt="Small Thumbnail" />' if thumb_uri else ''}
-                    {f'<img id="img-{eid}-raw" class="stage-img {"visible" if not cover_uri else ""}" src="{raw_uri}" alt="Raw Capture" />' if raw_uri else ''}
+                    {f'<img id="img-{eid}-raw" class="stage-img {"visible" if (not cover_uri and not video_uri) else ""}" src="{raw_uri}" alt="Raw Capture" />' if raw_uri else ''}
                   </div>
                   <div class="meta-strip">
                     <span>Assets: {len(raw_assets)}</span>
+                    <span>Format: {'2-Slide Carousel (Cover + Video)' if (video_uri and cover_uri) else ('Video' if video_uri else 'Single Image')}</span>
                     <span>File Import/EXIF: {_html_escape(src.get('capture_time') or 'Unknown')}</span>
                     <span>TZ Verified: {'Yes' if src.get('capture_timezone_known') else 'No (Naive Camera Clock)'}</span>
                     <span>Layout: {_html_escape(prod.get('layout_position') or 'n/a')} ({_html_escape(prod.get('font_size_px') or '-')}px)</span>
@@ -2601,6 +2995,7 @@ def build_pressroom(
     .badge-published {{ background: var(--published); color: #fff; }}
     .badge-synth {{ background: #6b21a8; color: #fff; }}
     .badge-char {{ background: #334155; color: #e2e8f0; }}
+    .badge-video {{ background: #0284c7; color: #fff; }}
     .event-id {{
       font-family: monospace;
       color: var(--muted);
@@ -2654,6 +3049,7 @@ def build_pressroom(
     }}
     .stage-img.visible {{ display: block; }}
     .stage-img.thumb-size {{ width: 220px; height: auto; }}
+    .stage-video {{ width: 100%; background: #000; }}
     .meta-strip {{
       margin-top: 10px;
       display: flex;
@@ -2753,11 +3149,12 @@ def build_pressroom(
       font-size: 0.78rem;
       font-family: monospace;
     }}
-    .wire-item img {{
+    .wire-item img, .wire-item video {{
       width: 100%;
       height: 150px;
       object-fit: cover;
       display: block;
+      background: #000;
     }}
     .wire-meta {{
       padding: 8px 10px;
@@ -2786,12 +3183,18 @@ def build_pressroom(
   </main>
   <script>
     function switchView(eid, mode) {{
-      const modes = ['cover', 'square', 'thumb', 'raw'];
+      const modes = ['cover', 'video', 'square', 'thumb', 'raw'];
       modes.forEach(m => {{
         const el = document.getElementById('img-' + eid + '-' + m);
         if (el) {{
-          if (m === mode) el.classList.add('visible');
-          else el.classList.remove('visible');
+          if (m === mode) {{
+            el.classList.add('visible');
+          }} else {{
+            el.classList.remove('visible');
+            if (el.tagName === 'VIDEO' && typeof el.pause === 'function') {{
+              el.pause();
+            }}
+          }}
         }}
       }});
       const card = document.getElementById('card-' + eid);
@@ -2867,8 +3270,76 @@ def _get_tailscale_urls(port: int) -> Dict[str, Optional[str]]:
     }
 
 
+def _run_range_http_server(serve_dir: Path, port: int) -> None:
+    """Run a threaded HTTP server with HTTP Range (`206 Partial Content`) support for MP4 video playback."""
+    import http.server
+    import socketserver
+
+    class RangeHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, directory=str(serve_dir), **kwargs)
+
+        def send_head(self) -> Any:
+            path = self.translate_path(self.path)
+            if os.path.isdir(path):
+                return super().send_head()
+            range_header = self.headers.get("Range")
+            if not range_header or not range_header.startswith("bytes="):
+                f = super().send_head()
+                return f
+            try:
+                file_size = os.path.getsize(path)
+                range_spec = range_header.split("=", 1)[1].strip()
+                start_str, end_str = (range_spec.split("-", 1) + [""])[:2]
+                start = int(start_str) if start_str else 0
+                end = int(end_str) if end_str else (file_size - 1)
+                end = min(end, file_size - 1)
+                if start > end or start >= file_size:
+                    self.send_error(416, "Requested Range Not Satisfiable")
+                    return None
+                length = end - start + 1
+                f = open(path, "rb")
+                f.seek(start)
+                ctype = self.guess_type(path)
+                self.send_response(206, "Partial Content")
+                self.send_header("Content-type", ctype)
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+                self.send_header("Content-Length", str(length))
+                self.send_header("Last-Modified", self.date_time_string(os.path.getmtime(path)))
+                self.end_headers()
+                self._range_remaining: Optional[int] = length
+                return f
+            except Exception:
+                return super().send_head()
+
+        def copyfile(self, source: Any, outputfile: Any) -> None:
+            remaining = getattr(self, "_range_remaining", None)
+            if remaining is None:
+                super().copyfile(source, outputfile)
+                return
+            self._range_remaining = None
+            buf_size = 64 * 1024
+            while remaining > 0:
+                chunk = source.read(min(buf_size, remaining))
+                if not chunk:
+                    break
+                outputfile.write(chunk)
+                remaining -= len(chunk)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            pass
+
+    class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    with ThreadedHTTPServer(("0.0.0.0", port), RangeHTTPRequestHandler) as httpd:
+        httpd.serve_forever()
+
+
 def ensure_pressroom_server(serve_dir: Path, port: int = 8766) -> Dict[str, Any]:
-    """Ensure a lightweight local HTTP server is serving `output/pressroom`."""
+    """Ensure a lightweight local HTTP server with HTTP Range video support is serving `output/pressroom`."""
     lan_ip = _get_lan_ip()
     local_url = f"http://localhost:{port}/"
     lan_url = f"http://{lan_ip}:{port}/"
@@ -2887,7 +3358,7 @@ def ensure_pressroom_server(serve_dir: Path, port: int = 8766) -> Dict[str, Any]
             }
 
     subprocess.Popen(
-        [sys.executable, "-m", "http.server", str(port), "--bind", "0.0.0.0"],
+        [sys.executable, str(Path(__file__).resolve()), "serve-http", "--dir", str(serve_dir), "--port", str(port)],
         cwd=str(serve_dir),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -3051,6 +3522,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_press = sub.add_parser("pressroom", help="Build and optionally serve the Local Web Pressroom")
     p_press.add_argument("--serve", action="store_true", help="Start local HTTP server on LOCAL_SERVER_PORT")
 
+    p_serve_http = sub.add_parser("serve-http", help="Run HTTP Range server for Pressroom directory")
+    p_serve_http.add_argument("--dir", required=True, help="Directory to serve")
+    p_serve_http.add_argument("--port", type=int, default=8766, help="Port to bind")
+
+    p_attach_vid = sub.add_parser(
+        "attach-video",
+        help="Attach 10s camera video to a dispatch for 2-slide Carousel (Cover + Video) publishing",
+    )
+    p_attach_vid.add_argument("event_id", help="Target dispatch event_id")
+    p_attach_vid.add_argument("--video-event-id", default=None, help="Optional companion video event_id")
+
     p_synth = sub.add_parser(
         "init-synthetic-demo",
         help="Create a 3-sighting synthetic test selection (1 ready story, 1 privacy hold, 1 empty-frame hold)",
@@ -3070,6 +3552,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
     if args.command == "pressroom":
         print(json.dumps(build_pressroom(start_server=args.serve), indent=2))
+        return 0
+    if args.command == "serve-http":
+        _run_range_http_server(Path(args.dir).resolve(), int(args.port))
+        return 0
+    if args.command == "attach-video":
+        res = attach_video_to_dispatch(args.event_id, video_event_id=args.video_event_id)
+        print(json.dumps(res, indent=2))
         return 0
     if args.command == "init-synthetic-demo":
         synth = create_synthetic_test_selection()

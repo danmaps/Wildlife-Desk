@@ -389,3 +389,69 @@ def test_publishing_kill_switch_locks_and_timeout_reconciliation(tmp_path: Path)
     redacted = wildlife_desk.redact_secrets("Token is secret-ig-token-xyz987!", cfg)
     assert "secret-ig-token-xyz987" not in redacted
     assert "[REDACTED_SECRET]" in redacted
+
+
+def test_attach_video_and_pressroom_video_playback(tmp_path: Path):
+    env = _make_test_env(tmp_path)
+    sel_dir = Path(env["LOCAL_WILDLIFE_DIR"])
+    _create_image_with_meta(
+        sel_dir, "OPOSSUM_001.jpg", color=(38, 42, 46), capture_time="2026-11-01T03:10:00", tz_known=False
+    )
+    vid_file = sel_dir / "OPOSSUM_002.mp4"
+    vid_file.write_bytes(b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom")
+    (vid_file.with_suffix(".mp4.meta.json")).write_text(
+        json.dumps(
+            {
+                "capture_time": "2026-11-01T03:10:05",
+                "capture_timezone_known": True,
+                "capture_time_provenance": "exif_tz",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    disc = wildlife_desk.discover_sightings(env_override=env)
+    assert disc["total_sightings"] == 2
+    img_eid = [
+        s["event_id"]
+        for s in disc["sightings"]
+        if wildlife_desk.load_dispatch_record(s["event_id"], env_override=env)["source"]["assets"][0]["media_type"]
+        == "image"
+    ][0]
+
+    # Auto-detect and attach the companion video event
+    paired = wildlife_desk.attach_video_to_dispatch(img_eid, env_override=env)
+    assert paired["production"]["post_format"] == "carousel_video"
+    assert paired["production"]["video_path"].endswith(".mp4")
+    assert len(paired["source"]["asset_ids"]) == 2
+
+    wildlife_desk.record_observations(
+        event_id=img_eid,
+        observations=[
+            {
+                "claim": "One opossum is visible crossing the clearing.",
+                "source_asset_ids": paired["source"]["asset_ids"],
+                "species": "opossum",
+                "certainty": "confirmed",
+            }
+        ],
+        contains_people=False,
+        contains_identifying_property=False,
+        env_override=env,
+    )
+    drafted = wildlife_desk.draft_dispatch(
+        event_id=img_eid,
+        headline="OPOSSUM CONDUCTS LOW-SPEED INSPECTION OF PERIMETER",
+        caption="An opossum crossed the clearing in infrared mode and continued through the ten-second clip.",
+        section="The Night Shift",
+        env_override=env,
+    )
+    assert drafted["production"]["post_format"] == "carousel_video"
+    assert drafted["production"]["video_path"].endswith(".mp4")
+
+    press = wildlife_desk.build_pressroom(start_server=False, env_override=env)
+    html_text = Path(press["pressroom_html_path"]).read_text(encoding="utf-8")
+    assert "SLIDESHOW: COVER + 10S VIDEO" in html_text
+    assert f"media/{img_eid}-video.mp4" in html_text
+    assert "<video" in html_text
+
