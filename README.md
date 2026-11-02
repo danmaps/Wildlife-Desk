@@ -48,9 +48,30 @@ These are logical roles. One small application can perform them; separate servic
 
 ## Project status
 
-**Planning and visual concept.** This repository contains the editorial brief, visual direction, configuration template, sample dispatch, and implementation roadmap. There is no working intake service, renderer, scheduler, or Instagram publisher yet.
+**Local Newsroom Studio & MCP Server implemented (`scripts/wildlife_desk.py`, `scripts/mcp_server.py`, `SKILL.md`).**
 
-The first build should produce one complete local draft from a deliberately selected camera capture. Autonomous publishing is the intended end state, after the same path can reliably handle privacy checks, uncertain observations, and retries.
+- **Implemented now**:
+  - **Explicit Selection Intake**: Restricted Immich album adapter (`IMMICH_WILDLIFE_ALBUM_ID`) and explicit local folder adapter (`LOCAL_WILDLIFE_DIR`), with hard boundary checks that stop intake if selection configuration is missing or overly broad.
+  - **Conservative Sighting Grouping & Clean Cache**: Deterministic event IDs, burst grouping when capture timestamps are reliable, capture-vs-import time provenance tracking, and EXIF/GPS-stripped local inspection previews (`state/media_cache/`).
+  - **Evidence & Eligibility Gate**: Structured observation claims tied to source asset IDs, species archive continuity checks (`RETURNS` / `THIRD VISIT` validation), clock-uncertainty enforcement, and mandatory privacy holds for people, property details, or empty frames.
+  - **Deterministic Cover Renderer**: `1080×1350` portrait front page, `1080×1080` 1:1 profile-grid crop preview, and `270×338` thumbnail using bundled SIL OFL `Barlow Condensed` typography, measured pixel-width wrapping, subject-aware text placement, and overflow rejection.
+  - **Local Web Pressroom & Agent Studio**: Interactive MCP server (`scripts/mcp_server.py`), Agent Skill (`SKILL.md`), and self-contained HTML Pressroom (`output/pressroom/index.html`) for collaborating with an AI agent as Reporter & Social Media Manager.
+  - **Publication Safety Gate**: Disabled-by-default kill switch (`PUBLISH_ENABLED=false`), atomic lock claims (`state/locks/`), duplicate prevention, and timeout reconciliation (`reconcile_publication`).
+- **Not yet implemented / disabled by default**:
+  - Live remote Instagram Graph API media hosting/upload and unattended cron scheduling. Note that the README hero image (`assets/wildlife-desk-hero.jpg`) remains the original AI-generated planning mockup, separate from renderer outputs.
+
+## Quick start (Local News Studio)
+
+```bash
+./setup.sh
+
+# Run offline boundary test suite
+.venv/bin/pytest -v
+
+# Initialize a 3-sighting synthetic demo (1 ready dispatch, 1 privacy hold, 1 empty-frame hold)
+# and open the Local Web Pressroom on http://localhost:8766/
+.venv/bin/python scripts/wildlife_desk.py init-synthetic-demo --serve
+```
 
 ## Start here
 
@@ -65,7 +86,7 @@ The first build should produce one complete local draft from a deliberately sele
 
 ## Configuration belongs outside the repository
 
-Copy [.env.example](.env.example) to a local `.env` when implementation begins. It contains proposed variable names and neutral placeholders, with publishing disabled. No configuration loader is implemented yet.
+Copy [.env.example](.env.example) to a local `.env` (or run `./setup.sh`). It contains neutral placeholders with publishing disabled (`PUBLISH_ENABLED=false`), loaded and redacted by `scripts/wildlife_desk.py`.
 
 Service URLs, account IDs, album IDs, model settings, and credentials belong in environment variables or the deployment's secret store. Keep camera media, private metadata, runtime state, and generated post queues outside Git. The project should be reusable without anyone else's infrastructure or personal details.
 

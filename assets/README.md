@@ -1,10 +1,18 @@
-# Design example
+# Design example and fonts
 
-`wildlife-desk-hero.jpg` is an AI-generated illustrative mockup created with the built-in image-generation tool. It demonstrates a headline overlay and masthead. It is not original trail-camera footage, a verified wildlife observation, or output from an implemented renderer.
+## Hero mockup (`wildlife-desk-hero.jpg`) and profile emblem (`wildlife-desk-profile.jpg`)
 
-The JPEG is an optimized format conversion of the generated PNG. It carries no personal camera or location metadata. No private reference images were supplied.
+`wildlife-desk-hero.jpg` is an AI-generated illustrative mockup created with the built-in image-generation tool. It demonstrates a headline overlay and masthead. It is not original trail-camera footage, a verified wildlife observation, or output from the cover renderer.
 
-## Generation prompt
+`wildlife-desk-profile.jpg` (`1024×1024`) is an AI-generated synthetic brand emblem designed for circular social profile crops (`@wildlife_desk`). It features a monochrome woodcut-and-infrared raccoon medallion with a `THE WILDLIFE DESK` banner. Like the hero mockup, it is a brand asset and never enters the wildlife reporting pipeline.
+
+Both JPEGs are optimized format conversions with zero personal, camera, or location metadata. No private reference images were supplied.
+
+## Bundled typography (`assets/fonts/`)
+
+The deterministic cover renderer in `scripts/wildlife_desk.py` uses **Barlow Condensed** (`BarlowCondensed-Bold.ttf` and `BarlowCondensed-SemiBold.ttf`), copyright The Barlow Project Authors, redistributed under the **SIL Open Font License 1.1** (`assets/fonts/OFL.txt`). If font files are absent, the renderer falls back to system `DejaVuSans-Bold.ttf`.
+
+## Generation prompt for `wildlife-desk-hero.jpg`
 
 Use case: ads-marketing.
 Asset type: wide hero image example for a GitHub README for "The Wildlife Desk", an autonomous wildlife camera newsroom.

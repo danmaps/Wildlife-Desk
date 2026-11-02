@@ -1,6 +1,6 @@
 # Working on The Wildlife Desk
 
-Read README.md and the docs before implementing. The project is currently a plan and visual concept. Report implemented behavior separately from proposed behavior.
+Read README.md and the docs before implementing. The Local Newsroom Studio, MCP server (`scripts/mcp_server.py`), Immich/local intake, eligibility validator, and cover renderer (`scripts/wildlife_desk.py`) are implemented; live remote Instagram upload and autonomous scheduling remain unimplemented and disabled by default. Report implemented behavior separately from proposed behavior.
 
 ## Scope
 

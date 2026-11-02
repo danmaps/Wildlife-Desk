@@ -1,6 +1,6 @@
 # Implementation plan
 
-Status: proposed design. No service is implemented or deployed.
+Status: **Local Newsroom Studio, MCP Server, Immich/Local Intake, and Deterministic Cover Renderer implemented** (`scripts/wildlife_desk.py`, `scripts/mcp_server.py`, `SKILL.md`). Live external Instagram Graph API upload and background scheduling remain unimplemented and disabled by default (`PUBLISH_ENABLED=false`).
 
 ## Intended flow
 
