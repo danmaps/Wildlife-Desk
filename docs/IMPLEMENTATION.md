@@ -1,6 +1,6 @@
 # Implementation plan
 
-Status: **Local Newsroom Studio, MCP Server, Immich/Local Intake, Deterministic Cover Renderer, and Instagram Graph API Publisher implemented** (`scripts/wildlife_desk.py`, `scripts/mcp_server.py`, `SKILL.md`). Publishing remains gated behind `PUBLISH_ENABLED=false` by default until explicitly enabled.
+Status: **Local Newsroom Studio, MCP Server, Immich/Local Intake, Deterministic Cover Renderer, and Instagram Graph API Publisher (Single-Image + 2-Slide Cover/Video Carousel) implemented** (`scripts/wildlife_desk.py`, `scripts/mcp_server.py`, `SKILL.md`). Publishing remains gated behind `PUBLISH_ENABLED=false` by default until explicitly enabled.
 
 ## Intended flow
 

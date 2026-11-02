@@ -29,7 +29,7 @@ Keep the animal's face and important behavior visible. Preview covers both at fu
 
 Use the original photograph as the source. Cropping, ordinary exposure adjustments, and overlays must preserve the evidence. Do not add animals, remove inconvenient context, or generate missing scene content. Remove exported location metadata and inspect for identifying visual details before public output.
 
-For video, use a representative frame for the cover and retain the relevant sequence. A short video and a still image can share the same headline system. Video editing and publishing are later extensions.
+For video, use a representative frame (or the companion still capture) for the `1080×1350` front-page cover and retain the 10-second camera sequence as Slide 2 of a 2-slide Instagram Carousel (`CAROUSEL` with Slide 1 = marked-up cover JPEG, Slide 2 = raw camera `.mp4`). No video re-encoding or overlay burning is required.
 
 ## Example caption pairing
 

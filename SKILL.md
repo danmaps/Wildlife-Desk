@@ -58,6 +58,9 @@ When acting as the user's **Reporter and Social Media Manager**, you run the edi
 3. Call `draft_dispatch(event_id, headline, caption, section, layout_position="auto")`:
    - **Headline**: 5–12 words, uppercase, deadpan municipal newspaper tone (e.g., `RACCOON PAUSES FOR UNSCHEDULED OVERNIGHT CAMERA INSPECTION`).
    - **Caption**: 60–120 words across 2–3 short paragraphs: state what happened, add supported details or uncertainties, and close with one dry observation. No emojis or hashtags.
+4. **Slideshow / Video Posts (`attach_video_to_dispatch`)**:
+   - When the trail camera records a Photo + 10s Video pair (or a standalone video), call `attach_video_to_dispatch(event_id, video_event_id=None)` (or CLI `python3 scripts/wildlife_desk.py attach-video <event_id>`).
+   - This pairs the still cover (Slide 1: `1080×1350` marked-up front page) with the raw 10-second camera `.mp4` (Slide 2: `VIDEO` child container) for a 2-slide Instagram `CAROUSEL` post without any video editing.
 
 ### Step 5: Inspect the Front Page & Open the Local Pressroom (`build_pressroom`)
 1. View the rendered cover (`output/<event_id>/cover-1080x1350.jpg`) and 1:1 grid crop (`output/<event_id>/crop-preview-1080x1080.jpg`) with your image viewer tool to verify that the headline is crisp and does not obscure the animal's face.
