@@ -48,17 +48,28 @@ These are logical roles. One small application can perform them; separate servic
 
 ## Project status
 
-**Local Newsroom Studio & MCP Server implemented (`scripts/wildlife_desk.py`, `scripts/mcp_server.py`, `SKILL.md`).**
+**Local Newsroom Studio, MCP server, and Instagram Graph API publisher implemented** (`scripts/wildlife_desk.py`, `scripts/mcp_server.py`, `SKILL.md`). Live publishing is disabled by default with `PUBLISH_ENABLED=false`. Implementation status does not establish deployment or live validation.
 
-- **Implemented now**:
-  - **Explicit Selection Intake**: Restricted Immich album adapter (`IMMICH_WILDLIFE_ALBUM_ID`) and explicit local folder adapter (`LOCAL_WILDLIFE_DIR`), with hard boundary checks that stop intake if selection configuration is missing or overly broad.
-  - **Conservative Sighting Grouping & Clean Cache**: Deterministic event IDs, burst grouping when capture timestamps are reliable, capture-vs-import time provenance tracking, and EXIF/GPS-stripped local inspection previews (`state/media_cache/`).
-  - **Evidence & Eligibility Gate**: Structured observation claims tied to source asset IDs, species archive continuity checks (`RETURNS` / `THIRD VISIT` validation), clock-uncertainty enforcement, and mandatory privacy holds for people, property details, or empty frames.
-  - **Deterministic Cover Renderer**: `1080×1350` portrait front page, `1080×1080` 1:1 profile-grid crop preview, and `270×338` thumbnail using bundled SIL OFL `Barlow Condensed` typography, measured pixel-width wrapping, subject-aware text placement, and overflow rejection.
-  - **Local Web Pressroom & Agent Studio**: Interactive MCP server (`scripts/mcp_server.py`), Agent Skill (`SKILL.md`), and self-contained HTML Pressroom (`output/pressroom/index.html`) for collaborating with an AI agent as Reporter & Social Media Manager.
-  - **Publication Safety Gate**: Disabled-by-default kill switch (`PUBLISH_ENABLED=false`), atomic lock claims (`state/locks/`), duplicate prevention, and timeout reconciliation (`reconcile_publication`).
-- **Not yet implemented / disabled by default**:
-  - Live remote Instagram Graph API media hosting/upload and unattended cron scheduling. Note that the README hero image (`assets/wildlife-desk-hero.jpg`) remains the original AI-generated planning mockup, separate from renderer outputs.
+### Implemented
+
+- **Explicit selection intake:** Restricted Immich album and explicit local folder adapters stop intake when source selection is missing or overly broad.
+- **Sighting records and inspection previews:** Timestamp-based burst grouping, capture-vs-import time provenance, deterministic IDs for unchanged asset groups, and EXIF/GPS-stripped still inspection previews. Incremental photo/video arrival can change group IDs; stable event identity across partial uploads remains work in [issue #2](https://github.com/danmaps/Wildlife-Desk/issues/2).
+- **Evidence and eligibility checks:** Source-linked observations, species archive continuity checks, clock-uncertainty checks, and privacy/empty-frame holds.
+- **Cover renderer:** `1080×1350` front page, `1080×1080` profile-grid crop preview, and `270×338` thumbnail using bundled SIL OFL Barlow Condensed typography, measured wrapping, subject-aware placement, and overflow rejection.
+- **Local Pressroom and agent workflow:** MCP server, agent skill, and HTML Pressroom for interactive inspection, drafting, and cover review.
+- **Instagram publishing adapter:** Single-image posts and two-slide cover/video carousels, temporary derivative staging in a configured directory served by an externally configured public HTTPS endpoint, media-container creation/status polling, publication, and receipts. The application does not provision that public hosting endpoint.
+- **Publication controls:** Disabled-by-default switch, per-event exclusive lock files, checks for recorded prior publications and unresolved submission timeouts, and an operator-supplied reconciliation function. These controls need further hardening for unattended operation.
+
+### Remaining before unattended operation
+
+[Issue #2](https://github.com/danmaps/Wildlife-Desk/issues/2) tracks resumable batch editorial work, stable photo/video event identity, persistent manual holds, full-clip video screening and sanitization, account-wide publication coordination, multi-week scheduling, Pressroom schedule projections, and token lifecycle handling.
+
+- No automated batch agent runner, built-in vision drafting adapter, `drip-publish` scheduler, or timer installation is implemented.
+- Attached videos are currently copied from the cache into public staging; whole-clip screening and audio/metadata/camera-overlay sanitization are not enforced by the publication gate.
+- Manual holds and `ready` state enforcement need hardening before unattended publication. Eligibility recalculation alone must not be treated as a persistent editorial veto.
+- A configured, enabled publisher can make live requests. Controlled live validation and operational readiness must be established separately before scheduled operation.
+
+The hero image remains an AI-generated planning mockup, separate from renderer outputs.
 
 ## Quick start (Local News Studio)
 
