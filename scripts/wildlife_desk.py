@@ -2025,6 +2025,10 @@ def publish_dispatch(
         cover_path = Path(record["production"]["cover_path"])
         stage_dir = Path(stage_dir_raw).expanduser().resolve()
         stage_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(stage_dir, 0o755)
+        except Exception:
+            pass
         ephemeral_token = hashlib.sha256(f"{event_id}:{attempt_time}:{os.urandom(8).hex()}".encode("utf-8")).hexdigest()[:24]
         staged_filename = f"wd-{ephemeral_token}.jpg"
         staged_file_path = stage_dir / staged_filename
@@ -2061,7 +2065,13 @@ def publish_dispatch(
                 with urllib.request.urlopen(c_req, timeout=30) as c_resp:
                     c_data = json.loads(c_resp.read().decode("utf-8"))
             except Exception as exc:
-                safe_err = redact_secrets(str(exc), config)
+                err_detail = str(exc)
+                if isinstance(exc, urllib.error.HTTPError):
+                    try:
+                        err_detail = f"{exc.code} {exc.read().decode('utf-8', errors='replace')}"
+                    except Exception:
+                        pass
+                safe_err = redact_secrets(err_detail, config)
                 pub.setdefault("attempts", []).append(
                     {
                         "attempted_at": attempt_time,
@@ -2078,6 +2088,26 @@ def publish_dispatch(
             creation_id = str(c_data.get("id") or "").strip()
             if not creation_id:
                 raise PublicationGateError("Instagram API did not return a creation_id for media container.")
+
+            # Poll container status briefly until FINISHED (up to 15 seconds)
+            status_url = (
+                f"{graph_host}/{urllib.parse.quote(creation_id)}"
+                f"?fields=status_code,status&access_token={urllib.parse.quote(ig_token)}"
+            )
+            for _ in range(10):
+                try:
+                    with urllib.request.urlopen(status_url, timeout=10) as st_resp:
+                        st_data = json.loads(st_resp.read().decode("utf-8"))
+                    st_code = str(st_data.get("status_code") or "").upper()
+                    if st_code in ("FINISHED", ""):
+                        break
+                    if st_code in ("ERROR", "EXPIRED"):
+                        raise PublicationGateError(f"Instagram container {creation_id} failed with status: {st_data}")
+                except PublicationGateError:
+                    raise
+                except Exception:
+                    pass
+                time.sleep(1.5)
 
             # Phase B: Publish Media Container
             publish_url = f"{graph_host}/{urllib.parse.quote(target_id)}/media_publish"

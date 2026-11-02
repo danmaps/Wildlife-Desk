@@ -1,6 +1,6 @@
 # Implementation plan
 
-Status: **Local Newsroom Studio, MCP Server, Immich/Local Intake, and Deterministic Cover Renderer implemented** (`scripts/wildlife_desk.py`, `scripts/mcp_server.py`, `SKILL.md`). Live external Instagram Graph API upload and background scheduling remain unimplemented and disabled by default (`PUBLISH_ENABLED=false`).
+Status: **Local Newsroom Studio, MCP Server, Immich/Local Intake, Deterministic Cover Renderer, and Instagram Graph API Publisher implemented** (`scripts/wildlife_desk.py`, `scripts/mcp_server.py`, `SKILL.md`). Publishing remains gated behind `PUBLISH_ENABLED=false` by default until explicitly enabled.
 
 ## Intended flow
 
