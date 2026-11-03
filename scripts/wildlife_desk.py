@@ -2320,6 +2320,16 @@ def publish_dispatch(
         stage_dir.mkdir(parents=True, exist_ok=True)
         try:
             os.chmod(stage_dir, 0o755)
+            # Ensure local web server (e.g. Caddy) can traverse ancestor directories if a parent was reset to 0700
+            curr_parent = stage_dir.parent
+            while curr_parent != curr_parent.parent and str(curr_parent).startswith("/home/"):
+                try:
+                    st_mode = curr_parent.stat().st_mode
+                    if not (st_mode & 0o001):
+                        os.chmod(curr_parent, st_mode | 0o001)
+                except Exception:
+                    pass
+                curr_parent = curr_parent.parent
         except Exception:
             pass
         ephemeral_token = hashlib.sha256(f"{event_id}:{attempt_time}:{os.urandom(8).hex()}".encode("utf-8")).hexdigest()[:24]
@@ -2384,7 +2394,7 @@ def publish_dispatch(
                     }
                 )
                 record["publication"] = pub
-                record["state"] = "failed"
+                record["state"] = "failed" if len(pub["attempts"]) >= 3 else "ready"
                 _save_dispatch_record(dispatch_path, record, config)
                 raise PublicationGateError(f"Instagram container creation ({step_label}) failed: {safe_err}") from exc
 
@@ -2416,7 +2426,7 @@ def publish_dispatch(
                             }
                         )
                         record["publication"] = pub
-                        record["state"] = "failed"
+                        record["state"] = "failed" if len(pub["attempts"]) >= 3 else "ready"
                         _save_dispatch_record(dispatch_path, record, config)
                         raise PublicationGateError(f"Instagram container {cid} ({step_label}) failed: {safe_st}")
                 except PublicationGateError:
