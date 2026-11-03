@@ -3314,7 +3314,7 @@ def build_pressroom(
     )
 
     cards_section_html = (
-        f'<section id="cards-view-section">{chr(10).join(active_cards_html)}{chr(10)}{wire_drawer_html}</section>'
+        f'<section id="cards-view-section" class="hidden-by-mode">{chr(10).join(active_cards_html)}{chr(10)}{wire_drawer_html}</section>'
         if (active_cards_html or wire_cards_html)
         else "<div class='empty-state'>No sightings discovered yet. Run <code>discover_sightings</code> to check the wire.</div>"
     )
@@ -3322,10 +3322,9 @@ def build_pressroom(
     toolbar_html = f"""
     <section class="pressroom-toolbar" aria-label="Pressroom Filters and View Switcher">
       <div class="toolbar-top">
-        <div class="view-mode-group" role="group" aria-label="Layout Mode">
-          <button type="button" class="mode-btn active" id="mode-both" onclick="setLayoutMode('both')">⊞ Table + Cards</button>
-          <button type="button" class="mode-btn" id="mode-table" onclick="setLayoutMode('table')">☰ Table Only</button>
-          <button type="button" class="mode-btn" id="mode-cards" onclick="setLayoutMode('cards')">▤ Cards Only</button>
+        <div class="view-mode-group" role="tablist" aria-label="Pressroom View Tabs">
+          <button type="button" role="tab" aria-selected="true" class="mode-btn active" id="mode-table" onclick="setLayoutMode('table')">☰ Table View</button>
+          <button type="button" role="tab" aria-selected="false" class="mode-btn" id="mode-cards" onclick="setLayoutMode('cards')">▤ Cards View</button>
         </div>
 
         <div class="state-chip-group" role="group" aria-label="Quick State Filter">
@@ -3950,20 +3949,23 @@ def build_pressroom(
     {cards_section_html}
   </main>
   <script>
-    let currentLayoutMode = 'both';
+    let currentLayoutMode = 'table';
     let currentSortAsc = true;
     let lastSortCol = 'default';
 
     function setLayoutMode(mode) {{
       currentLayoutMode = mode;
-      ['both', 'table', 'cards'].forEach(m => {{
+      ['table', 'cards'].forEach(m => {{
         const btn = document.getElementById('mode-' + m);
-        if (btn) btn.classList.toggle('active', m === mode);
+        if (btn) {{
+          btn.classList.toggle('active', m === mode);
+          btn.setAttribute('aria-selected', m === mode ? 'true' : 'false');
+        }}
       }});
       const tblSec = document.getElementById('table-view-section');
       const crdSec = document.getElementById('cards-view-section');
-      if (tblSec) tblSec.classList.toggle('hidden-by-mode', mode === 'cards');
-      if (crdSec) crdSec.classList.toggle('hidden-by-mode', mode === 'table');
+      if (tblSec) tblSec.classList.toggle('hidden-by-mode', mode !== 'table');
+      if (crdSec) crdSec.classList.toggle('hidden-by-mode', mode !== 'cards');
     }}
 
     function setQuickState(st) {{
@@ -4100,9 +4102,7 @@ def build_pressroom(
     }}
 
     function jumpToCard(eid) {{
-      if (currentLayoutMode === 'table') {{
-        setLayoutMode('both');
-      }}
+      setLayoutMode('cards');
       const card = document.getElementById('card-' + eid);
       if (card) {{
         card.classList.remove('hidden-by-filter');
