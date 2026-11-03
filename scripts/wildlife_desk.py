@@ -1597,6 +1597,53 @@ def hold_dispatch(
     return record
 
 
+def unhold_dispatch(
+    event_id: str,
+    env_override: Optional[Dict[str, str]] = None,
+    repo_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """
+    Re-evaluate eligibility for a held dispatch and restore it to `ready` (or `drafted`)
+    if all privacy, factual support, and cover rendering gates pass.
+    """
+    config = load_config(env_override=env_override, repo_dir=repo_dir)
+    dirs = ensure_runtime_dirs(config)
+    dispatch_path = dirs["dispatches"] / f"{event_id}.json"
+    record = load_dispatch_record(event_id, env_override=env_override, repo_dir=repo_dir)
+
+    if record.get("state") == "published":
+        raise WildlifeDeskError(f"Dispatch {event_id} is already published.")
+
+    elig = _recompute_eligibility(record, env_override=env_override, repo_dir=repo_dir)
+    if (
+        elig.get("privacy_check") == "passed"
+        and elig.get("factual_support_check") == "passed"
+        and not elig.get("publishable")
+        and (record.get("editorial") or {}).get("headline")
+        and (record.get("editorial") or {}).get("caption")
+    ):
+        # Cover may not have been rendered yet; attempt deterministic render
+        record = render_dispatch_cover(
+            event_id=event_id,
+            layout_position=(record.get("production") or {}).get("layout_position"),
+            crop_focus_x=(record.get("production") or {}).get("crop_focus_x"),
+            crop_focus_y=(record.get("production") or {}).get("crop_focus_y"),
+            env_override=env_override,
+            repo_dir=repo_dir,
+        )
+        elig = record["eligibility"]
+
+    if elig.get("publishable"):
+        record["state"] = "ready"
+        _save_dispatch_record(dispatch_path, record, config)
+        return record
+
+    reasons = "; ".join(elig.get("hold_reasons") or ["Eligibility checks did not pass."])
+    record["state"] = "held"
+    _save_dispatch_record(dispatch_path, record, config)
+    raise ValidationHoldError(f"Cannot unhold {event_id} to ready: {reasons}")
+
+
 # ---------------------------------------------------------------------------
 # Deterministic 1080x1350 Front-Page Cover Renderer
 # ---------------------------------------------------------------------------
@@ -3015,6 +3062,11 @@ def build_pressroom(
         primary_filename = _html_escape(raw_assets[0].get("filename") if raw_assets else "")
         capture_time_str = _html_escape(src.get("capture_time") or "")
         camera_stamp_str = _html_escape(ed.get("camera_stamp") or src.get("camera_stamp") or "")
+        focus_x_val = float(prod.get("crop_focus_x") if prod.get("crop_focus_x") is not None else 0.5)
+        focus_y_val = float(prod.get("crop_focus_y") if prod.get("crop_focus_y") is not None else 0.5)
+        focus_x_pct = max(0.0, min(100.0, focus_x_val * 100.0))
+        focus_y_pct = max(0.0, min(100.0, focus_y_val * 100.0))
+        curr_layout_pos = str(prod.get("layout_position") or "auto")
 
         video_src_path = prod.get("video_path")
         if not video_src_path:
@@ -3115,8 +3167,10 @@ def build_pressroom(
                 <div class="tbl-muted">{camera_stamp_str or (capture_time_str[:19].replace('T', ' ') if capture_time_str else '—')}</div>
               </td>
               <td class="col-actions">
-                <button class="tab-btn" onclick="jumpToCard('{eid}')">Inspect Card</button>
+                <button class="tab-btn" onclick="jumpToCard('{eid}')">Inspect</button>
+                <button class="tab-btn" onclick="openCardEditor('{eid}')">✎ Edit</button>
                 {f'<button class="tab-btn" onclick="jumpToCardVideo(\'{eid}\')">▶ Video</button>' if video_uri else ''}
+                {f'<button class="tab-btn btn-hold" onclick="promptHoldDispatch(\'{eid}\')">⏸ Hold</button>' if state in ('ready', 'drafted', 'observed') else (f'<button class="tab-btn btn-unhold" onclick="unholdDispatch(\'{eid}\')">▶ Ready</button>' if state == 'held' else '')}
                 {f'<button class="copy-btn" onclick="copyCaption(\'{eid}\')">Copy</button>' if ed.get('caption') else ''}
               </td>
             </tr>
@@ -3161,14 +3215,14 @@ def build_pressroom(
 
         hold_items = [f"<li>{_html_escape(h)}</li>" for h in (elig.get("hold_reasons") or [])]
         hold_html = (
-            f"<div class='hold-box'><strong>Hold / Gate Reasons:</strong><ul>{''.join(hold_items)}</ul></div>"
+            f"<div class='hold-box' id='hold-box-{eid}'><strong>Hold / Gate Reasons:</strong><ul>{''.join(hold_items)}</ul></div>"
             if hold_items
-            else "<div class='pass-box'>All factual support, privacy, and typography checks passed. Eligible for front page.</div>"
+            else f"<div class='pass-box' id='hold-box-{eid}'>All factual support, privacy, and typography checks passed. Eligible for front page.</div>"
         )
 
         badge_class = f"badge-{state}"
         synth_badge = "<span class='badge badge-synth'>SYNTHETIC FIXTURE</span>" if synthetic else ""
-        char_badge = f"<span class='badge badge-char'>{char_label}</span>" if char_label else ""
+        char_badge = f"<span class='badge badge-char' id='badge-char-{eid}'>{char_label}</span>" if char_label else f"<span class='badge badge-char' id='badge-char-{eid}' style='display:none'></span>"
         sched_slot = slot_by_eid.get(rec.get("event_id"))
         sched_badge = (
             f"<span class='badge badge-sched'>SCHEDULED #{sched_slot['queue_position']}: {_html_escape(sched_slot['scheduled_label'])}</span>"
@@ -3204,8 +3258,26 @@ def build_pressroom(
         if raw_uri:
             active_cls = " active" if (not cover_uri and not video_uri) else ""
             view_buttons.append(
-                f"<button class='tab-btn{active_cls}' onclick=\"switchView('{eid}', 'raw')\">Raw Camera Frame</button>"
+                f"<button class='tab-btn{active_cls}' onclick=\"switchView('{eid}', 'raw')\">🎯 Raw Frame (Click to Crop)</button>"
             )
+
+        sec_options = "".join(
+            f'<option value="{_html_escape(s_opt)}" {"selected" if s_opt == (ed.get("section") or "Local Affairs") else ""}>{_html_escape(s_opt)}</option>'
+            for s_opt in VALID_SECTIONS
+        )
+        layout_options = "".join(
+            f'<option value="{pos_opt}" {"selected" if pos_opt == curr_layout_pos else ""}>{pos_opt}</option>'
+            for pos_opt in ("auto", "bottom-left", "bottom-right", "top-left", "top-right")
+        )
+        hold_toggle_btn = (
+            f'<button type="button" class="tab-btn btn-hold" id="card-hold-btn-{eid}" onclick="promptHoldDispatch(\'{eid}\')">⏸ Hold Dispatch</button>'
+            if state != "held" and state != "published"
+            else (
+                f'<button type="button" class="tab-btn btn-unhold" id="card-hold-btn-{eid}" onclick="unholdDispatch(\'{eid}\')">▶ Unhold to Ready</button>'
+                if state == "held"
+                else ""
+            )
+        )
 
         active_cards_html.append(
             f"""
@@ -3218,11 +3290,11 @@ def build_pressroom(
                      data-search="{search_blob}">
               <header class="card-header">
                 <div>
-                  <span class="kicker">{section}</span>
-                  <h2>{headline}</h2>
+                  <span class="kicker" id="card-kicker-{eid}">{section}</span>
+                  <h2 id="card-headline-{eid}">{headline}</h2>
                 </div>
                 <div class="badges">
-                  <span class="badge {badge_class}">{state.upper()}</span>
+                  <span class="badge {badge_class}" id="card-state-badge-{eid}">{state.upper()}</span>
                   {sched_badge}
                   {video_badge}
                   {synth_badge}
@@ -3239,23 +3311,87 @@ def build_pressroom(
                     {f'<video id="img-{eid}-video" class="stage-img stage-video {"visible" if not cover_uri else ""}" controls playsinline preload="metadata" poster="{raw_uri or cover_uri or ""}" src="{video_uri}"></video>' if video_uri else ''}
                     {f'<img id="img-{eid}-square" class="stage-img" src="{square_uri}" alt="1:1 Profile Crop" />' if square_uri else ''}
                     {f'<img id="img-{eid}-thumb" class="stage-img thumb-size" src="{thumb_uri}" alt="Small Thumbnail" />' if thumb_uri else ''}
-                    {f'<img id="img-{eid}-raw" class="stage-img {"visible" if (not cover_uri and not video_uri) else ""}" src="{raw_uri}" alt="Raw Capture" />' if raw_uri else ''}
+                    {f'<div id="img-{eid}-raw" class="stage-img raw-crop-wrap {"visible" if (not cover_uri and not video_uri) else ""}"><img id="raw-photo-{eid}" class="raw-crop-img" src="{raw_uri}" alt="Raw Capture" onclick="handleRawImageClick(event, \'{eid}\')" title="Click anywhere on this raw frame to set the 4:5 crop focal point and re-render cover" /><div id="reticle-{eid}" class="crop-reticle" style="left:{focus_x_pct:.1f}%;top:{focus_y_pct:.1f}%;"></div></div>' if raw_uri else ''}
+                  </div>
+                  <div class="crop-studio-bar" id="studio-bar-{eid}">
+                    <div class="layout-pills">
+                      <span class="studio-lbl">Box Layout:</span>
+                      <button type="button" class="pos-pill {'active' if curr_layout_pos == 'auto' else ''}" data-pos="auto" onclick="quickSetLayout('{eid}', 'auto')">Auto</button>
+                      <button type="button" class="pos-pill {'active' if curr_layout_pos == 'bottom-left' else ''}" data-pos="bottom-left" onclick="quickSetLayout('{eid}', 'bottom-left')">Bottom-L</button>
+                      <button type="button" class="pos-pill {'active' if curr_layout_pos == 'bottom-right' else ''}" data-pos="bottom-right" onclick="quickSetLayout('{eid}', 'bottom-right')">Bottom-R</button>
+                      <button type="button" class="pos-pill {'active' if curr_layout_pos == 'top-left' else ''}" data-pos="top-left" onclick="quickSetLayout('{eid}', 'top-left')">Top-L</button>
+                      <button type="button" class="pos-pill {'active' if curr_layout_pos == 'top-right' else ''}" data-pos="top-right" onclick="quickSetLayout('{eid}', 'top-right')">Top-R</button>
+                    </div>
+                    <div class="crop-hint" id="crop-hint-{eid}">
+                      🎯 Click <strong>Raw Frame</strong> tab &amp; click photo to set crop focus (<span id="focus-readout-{eid}">{focus_x_val:.2f}, {focus_y_val:.2f}</span>)
+                    </div>
                   </div>
                   <div class="meta-strip">
                     <span>Assets: {len(raw_assets)}</span>
                     <span>Format: {'2-Slide Carousel (Cover + Video)' if (video_uri and cover_uri) else ('Video' if video_uri else 'Single Image')}</span>
-                    {f'<span>Camera Stamp: <strong>{camera_stamp_str}</strong></span>' if camera_stamp_str else ''}
+                    <span id="meta-stamp-{eid}">{f'Camera Stamp: <strong>{camera_stamp_str}</strong>' if camera_stamp_str else ''}</span>
                     <span>File Import/EXIF: {_html_escape(src.get('capture_time') or 'Unknown')}</span>
                     <span>TZ Verified: {'Yes' if src.get('capture_timezone_known') else 'No (Naive Camera Clock)'}</span>
-                    <span>Layout: {_html_escape(prod.get('layout_position') or 'n/a')} ({_html_escape(prod.get('font_size_px') or '-')}px)</span>
+                    <span id="meta-layout-{eid}">Layout: {_html_escape(prod.get('layout_position') or 'n/a')} ({_html_escape(prod.get('font_size_px') or '-')}px)</span>
                   </div>
                 </div>
 
                 <div class="editorial-col">
+                  <details class="edit-drawer" id="editor-{eid}">
+                    <summary>
+                      <span>✎ Interactive Dispatch Editor &amp; Layout Controls</span>
+                      <span class="drawer-hint">Edit headline, caption, beat, HUD stamp, or hold state</span>
+                    </summary>
+                    <div class="edit-form">
+                      <div class="edit-row-full">
+                        <label for="edit-headline-{eid}">Headline (5–12 words, uppercase newspaper style)</label>
+                        <input type="text" id="edit-headline-{eid}" value="{_html_escape(ed.get('headline') or '')}" />
+                      </div>
+                      <div class="edit-row-grid">
+                        <div>
+                          <label for="edit-section-{eid}">Beat Section</label>
+                          <select id="edit-section-{eid}">{sec_options}</select>
+                        </div>
+                        <div>
+                          <label for="edit-char-{eid}">Character / Subject Label</label>
+                          <input type="text" id="edit-char-{eid}" value="{char_label}" placeholder="e.g. Coyote #1" />
+                        </div>
+                        <div>
+                          <label for="edit-stamp-{eid}">Camera HUD Stamp</label>
+                          <input type="text" id="edit-stamp-{eid}" value="{camera_stamp_str}" placeholder="MM/DD/YYYY HH:MM:SS • °C / °F" />
+                        </div>
+                        <div>
+                          <label for="edit-layout-{eid}">Headline Box Position</label>
+                          <select id="edit-layout-{eid}">{layout_options}</select>
+                        </div>
+                        <div>
+                          <label for="edit-focus-x-{eid}">Crop Focus X (0.00–1.00)</label>
+                          <input type="number" step="0.01" min="0" max="1" id="edit-focus-x-{eid}" value="{focus_x_val:.2f}" />
+                        </div>
+                        <div>
+                          <label for="edit-focus-y-{eid}">Crop Focus Y (0.00–1.00)</label>
+                          <input type="number" step="0.01" min="0" max="1" id="edit-focus-y-{eid}" value="{focus_y_val:.2f}" />
+                        </div>
+                      </div>
+                      <div class="edit-row-full">
+                        <label for="edit-caption-{eid}">Instagram Caption Article</label>
+                        <textarea id="edit-caption-{eid}" rows="6">{_html_escape(ed.get('caption') or '')}</textarea>
+                      </div>
+                      <div class="edit-actions-bar">
+                        <button type="button" class="save-btn" onclick="saveDispatchDraft('{eid}')">💾 Save &amp; Re-Render Cover</button>
+                        {hold_toggle_btn}
+                        <span class="edit-status" id="edit-status-{eid}"></span>
+                      </div>
+                    </div>
+                  </details>
+
                   <div class="section-block">
                     <div class="block-title-row">
-                      <h3>Instagram Caption Article ({_html_escape(ed.get('word_count') or 0)} words)</h3>
-                      <button class="copy-btn" onclick="copyCaption('{eid}')">Copy Caption</button>
+                      <h3 id="caption-wordcount-{eid}">Instagram Caption Article ({_html_escape(ed.get('word_count') or 0)} words)</h3>
+                      <div>
+                        <button class="tab-btn" onclick="toggleCardEditor('{eid}')">✎ Edit</button>
+                        <button class="copy-btn" onclick="copyCaption('{eid}')">Copy Caption</button>
+                      </div>
                     </div>
                     <pre class="caption-box" id="caption-{eid}">{caption}</pre>
                   </div>
@@ -3945,6 +4081,191 @@ def build_pressroom(
     .hidden-by-filter, .hidden-by-mode {{
       display: none !important;
     }}
+    /* Interactive Crop Picker & Inline Editor */
+    .raw-crop-wrap {{
+      position: relative;
+      display: none;
+      max-width: 100%;
+    }}
+    .raw-crop-wrap.visible {{
+      display: inline-block;
+    }}
+    .raw-crop-img {{
+      display: block;
+      max-width: 100%;
+      max-height: 620px;
+      border-radius: 4px;
+      cursor: crosshair;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    }}
+    .crop-reticle {{
+      position: absolute;
+      width: 24px;
+      height: 24px;
+      margin-left: -12px;
+      margin-top: -12px;
+      border: 2px solid #38bdf8;
+      border-radius: 50%;
+      background: rgba(56, 189, 248, 0.25);
+      box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.75);
+      pointer-events: none;
+      transition: left 0.12s ease, top 0.12s ease;
+    }}
+    .crop-reticle::after {{
+      content: "";
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 4px;
+      height: 4px;
+      margin-left: -2px;
+      margin-top: -2px;
+      background: #fff;
+      border-radius: 50%;
+    }}
+    .crop-studio-bar {{
+      margin-top: 10px;
+      padding: 10px 12px;
+      background: #101418;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }}
+    .layout-pills {{
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }}
+    .studio-lbl {{
+      font-size: 0.74rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      font-weight: 700;
+      margin-right: 4px;
+    }}
+    .pos-pill {{
+      background: #1d242c;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 4px 9px;
+      font-size: 0.75rem;
+      cursor: pointer;
+    }}
+    .pos-pill.active {{
+      background: #38bdf8;
+      color: #090b0d;
+      border-color: #38bdf8;
+      font-weight: 700;
+    }}
+    .crop-hint {{
+      font-size: 0.78rem;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }}
+    .edit-drawer {{
+      background: #101418;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      margin-bottom: 18px;
+      overflow: hidden;
+    }}
+    .edit-drawer summary {{
+      padding: 10px 14px;
+      cursor: pointer;
+      font-weight: 700;
+      font-size: 0.85rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      user-select: none;
+      background: #14191f;
+    }}
+    .drawer-hint {{
+      font-weight: 400;
+      font-size: 0.76rem;
+      color: var(--muted);
+    }}
+    .edit-form {{
+      padding: 14px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }}
+    .edit-row-full {{
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }}
+    .edit-row-grid {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }}
+    @media (max-width: 680px) {{
+      .edit-row-grid {{ grid-template-columns: 1fr; }}
+    }}
+    .edit-form label {{
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      font-weight: 700;
+      display: block;
+      margin-bottom: 3px;
+    }}
+    .edit-form input, .edit-form select, .edit-form textarea {{
+      width: 100%;
+      background: #090b0d;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 8px 10px;
+      font-size: 0.88rem;
+      font-family: inherit;
+    }}
+    .edit-form textarea {{
+      font-family: Georgia, "Times New Roman", serif;
+      line-height: 1.5;
+      resize: vertical;
+    }}
+    .edit-actions-bar {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }}
+    .save-btn {{
+      background: #2563eb;
+      color: #fff;
+      border: 1px solid #3b82f6;
+      padding: 7px 14px;
+      border-radius: 5px;
+      cursor: pointer;
+      font-weight: 700;
+      font-size: 0.82rem;
+    }}
+    .save-btn:hover {{ background: #1d4ed8; }}
+    .btn-hold {{
+      border-color: #c2410c;
+      color: #fdba74;
+    }}
+    .btn-unhold {{
+      border-color: #15803d;
+      color: #86efac;
+    }}
+    .edit-status {{
+      font-size: 0.8rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }}
+    .edit-status.ok {{ color: #34d399; }}
+    .edit-status.err {{ color: #f87171; }}
   </style>
 </head>
 <body>
@@ -3954,10 +4275,10 @@ def build_pressroom(
       <p class="masthead-sub">A local newsroom covering an extremely small jurisdiction. Accurate observations. Absurdly serious coverage.</p>
     </div>
     <div class="status-pills">
-      <span class="pill">Ready: {counts.get('ready', 0)}</span>
-      <span class="pill">Drafted/Observed: {counts.get('drafted', 0) + counts.get('observed', 0) + counts.get('discovered', 0)}</span>
-      <span class="pill">Held: {counts.get('held', 0)}</span>
-      <span class="pill">Published: {counts.get('published', 0)}</span>
+      <span class="pill" id="pill-ready">Ready: {counts.get('ready', 0)}</span>
+      <span class="pill" id="pill-drafted">Drafted/Observed: {counts.get('drafted', 0) + counts.get('observed', 0) + counts.get('discovered', 0)}</span>
+      <span class="pill" id="pill-held">Held: {counts.get('held', 0)}</span>
+      <span class="pill" id="pill-published">Published: {counts.get('published', 0)}</span>
       <span class="pill">Publish Switch: {'ENABLED' if config.get('publish_enabled') else 'DISABLED (SAFE)'}</span>
     </div>
   </header>
@@ -4130,6 +4451,21 @@ def build_pressroom(
       }}
     }}
 
+    function openCardEditor(eid) {{
+      jumpToCard(eid);
+      const drawer = document.getElementById('editor-' + eid);
+      if (drawer) {{
+        drawer.open = true;
+        const hl = document.getElementById('edit-headline-' + eid);
+        if (hl) hl.focus();
+      }}
+    }}
+
+    function toggleCardEditor(eid) {{
+      const drawer = document.getElementById('editor-' + eid);
+      if (drawer) drawer.open = !drawer.open;
+    }}
+
     function jumpToCardVideo(eid) {{
       jumpToCard(eid);
       switchView(eid, 'video');
@@ -4156,17 +4492,262 @@ def build_pressroom(
       }});
       const card = document.getElementById('card-' + eid);
       if (card) {{
-        const btns = card.querySelectorAll('.tab-btn');
+        const btns = card.querySelectorAll('.view-tabs .tab-btn');
         btns.forEach(b => {{
-          if (b.getAttribute('onclick').includes("'" + mode + "'")) b.classList.add('active');
+          if ((b.getAttribute('onclick') || '').includes("'" + mode + "'")) b.classList.add('active');
           else b.classList.remove('active');
         }});
       }}
     }}
+
     function copyCaption(eid) {{
       const pre = document.getElementById('caption-' + eid);
       if (pre && navigator.clipboard) {{
         navigator.clipboard.writeText(pre.innerText);
+      }}
+    }}
+
+    function setEditStatus(eid, msg, isErr) {{
+      const st = document.getElementById('edit-status-' + eid);
+      if (st) {{
+        st.textContent = msg;
+        st.className = 'edit-status ' + (isErr ? 'err' : 'ok');
+      }}
+      const hint = document.getElementById('crop-hint-' + eid);
+      if (hint && msg) {{
+        hint.textContent = msg;
+      }}
+    }}
+
+    async function postPressroomApi(url, payload) {{
+      const resp = await fetch(url, {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify(payload || {{}})
+      }});
+      const data = await resp.json();
+      if (!resp.ok || !data.ok) {{
+        throw new Error(data.error || ('HTTP ' + resp.status));
+      }}
+      return data;
+    }}
+
+    function updateHeaderCounts(counts) {{
+      if (!counts) return;
+      const r = document.getElementById('pill-ready');
+      const d = document.getElementById('pill-drafted');
+      const h = document.getElementById('pill-held');
+      const p = document.getElementById('pill-published');
+      if (r) r.textContent = 'Ready: ' + (counts.ready || 0);
+      if (d) d.textContent = 'Drafted/Observed: ' + ((counts.drafted || 0) + (counts.observed || 0) + (counts.discovered || 0));
+      if (h) h.textContent = 'Held: ' + (counts.held || 0);
+      if (p) p.textContent = 'Published: ' + (counts.published || 0);
+    }}
+
+    function applyUpdatedRecordToDOM(eid, rec, counts, cacheBust) {{
+      const state = rec.state || 'discovered';
+      const ed = rec.editorial || {{}};
+      const prod = rec.production || {{}};
+      const elig = rec.eligibility || {{}};
+      const ts = cacheBust || Date.now();
+
+      ['cover', 'square', 'thumb'].forEach(kind => {{
+        const img = document.getElementById('img-' + eid + '-' + kind);
+        if (img) img.src = 'media/' + eid + '-' + kind + '.jpg?t=' + ts;
+      }});
+      const rowThumb = document.querySelector('#row-' + eid + ' .tbl-thumb');
+      if (rowThumb) rowThumb.src = 'media/' + eid + '-thumb.jpg?t=' + ts;
+
+      const fx = typeof prod.crop_focus_x === 'number' ? prod.crop_focus_x : 0.5;
+      const fy = typeof prod.crop_focus_y === 'number' ? prod.crop_focus_y : 0.5;
+      const reticle = document.getElementById('reticle-' + eid);
+      if (reticle) {{
+        reticle.style.left = (fx * 100).toFixed(1) + '%';
+        reticle.style.top = (fy * 100).toFixed(1) + '%';
+      }}
+      const fxIn = document.getElementById('edit-focus-x-' + eid);
+      const fyIn = document.getElementById('edit-focus-y-' + eid);
+      if (fxIn) fxIn.value = fx.toFixed(2);
+      if (fyIn) fyIn.value = fy.toFixed(2);
+      const fReadout = document.getElementById('focus-readout-' + eid);
+      if (fReadout) fReadout.textContent = fx.toFixed(2) + ', ' + fy.toFixed(2);
+
+      const layoutPos = prod.layout_position || 'auto';
+      const layoutSel = document.getElementById('edit-layout-' + eid);
+      if (layoutSel) layoutSel.value = layoutPos;
+      document.querySelectorAll('#studio-bar-' + eid + ' .pos-pill').forEach(btn => {{
+        btn.classList.toggle('active', btn.getAttribute('data-pos') === layoutPos);
+      }});
+      const metaLayout = document.getElementById('meta-layout-' + eid);
+      if (metaLayout) metaLayout.textContent = 'Layout: ' + layoutPos + ' (' + (prod.font_size_px || '-') + 'px)';
+
+      const card = document.getElementById('card-' + eid);
+      if (card) {{
+        card.setAttribute('data-state', state);
+        card.setAttribute('data-section', ed.section || 'Local Affairs');
+        card.className = 'dispatch-card state-' + state;
+      }}
+      const row = document.getElementById('row-' + eid);
+      if (row) {{
+        row.setAttribute('data-state', state);
+        row.setAttribute('data-section', ed.section || 'Local Affairs');
+        row.className = 'dispatch-row state-' + state;
+        const rBadge = row.querySelector('.col-status .badge');
+        if (rBadge) {{
+          rBadge.className = 'badge badge-' + state;
+          rBadge.textContent = state.toUpperCase();
+        }}
+        const rHl = row.querySelector('.tbl-headline-link');
+        if (rHl && ed.headline) rHl.textContent = ed.headline;
+        const rKicker = row.querySelector('.tbl-kicker');
+        if (rKicker) rKicker.textContent = (ed.section || 'Local Affairs') + (ed.character_label ? ' • ' + ed.character_label : '');
+      }}
+
+      const cHl = document.getElementById('card-headline-' + eid);
+      if (cHl && ed.headline) cHl.textContent = ed.headline;
+      const cKicker = document.getElementById('card-kicker-' + eid);
+      if (cKicker && ed.section) cKicker.textContent = ed.section;
+      const cBadge = document.getElementById('card-state-badge-' + eid);
+      if (cBadge) {{
+        cBadge.className = 'badge badge-' + state;
+        cBadge.textContent = state.toUpperCase();
+      }}
+      const capPre = document.getElementById('caption-' + eid);
+      if (capPre && ed.caption) capPre.textContent = ed.caption;
+      const capIn = document.getElementById('edit-caption-' + eid);
+      if (capIn && ed.caption) capIn.value = ed.caption;
+      const wc = document.getElementById('caption-wordcount-' + eid);
+      if (wc) wc.textContent = 'Instagram Caption Article (' + (ed.word_count || 0) + ' words)';
+
+      const holdBox = document.getElementById('hold-box-' + eid);
+      if (holdBox) {{
+        const reasons = elig.hold_reasons || [];
+        if (reasons.length > 0) {{
+          holdBox.className = 'hold-box';
+          holdBox.innerHTML = '<strong>Hold / Gate Reasons:</strong><ul>' + reasons.map(r => '<li>' + r + '</li>').join('') + '</ul>';
+        }} else {{
+          holdBox.className = 'pass-box';
+          holdBox.textContent = 'All factual support, privacy, and typography checks passed. Eligible for front page.';
+        }}
+      }}
+      const cardHoldBtn = document.getElementById('card-hold-btn-' + eid);
+      if (cardHoldBtn && state !== 'published') {{
+        if (state === 'held') {{
+          cardHoldBtn.className = 'tab-btn btn-unhold';
+          cardHoldBtn.textContent = '▶ Unhold to Ready';
+          cardHoldBtn.setAttribute('onclick', "unholdDispatch('" + eid + "')");
+        }} else {{
+          cardHoldBtn.className = 'tab-btn btn-hold';
+          cardHoldBtn.textContent = '⏸ Hold Dispatch';
+          cardHoldBtn.setAttribute('onclick', "promptHoldDispatch('" + eid + "')");
+        }}
+      }}
+      if (row) {{
+        const rowHoldBtn = row.querySelector('.col-actions .btn-hold, .col-actions .btn-unhold');
+        if (rowHoldBtn && state !== 'published') {{
+          if (state === 'held') {{
+            rowHoldBtn.className = 'tab-btn btn-unhold';
+            rowHoldBtn.textContent = '▶ Ready';
+            rowHoldBtn.setAttribute('onclick', "unholdDispatch('" + eid + "')");
+          }} else {{
+            rowHoldBtn.className = 'tab-btn btn-hold';
+            rowHoldBtn.textContent = '⏸ Hold';
+            rowHoldBtn.setAttribute('onclick', "promptHoldDispatch('" + eid + "')");
+          }}
+        }}
+      }}
+      updateHeaderCounts(counts);
+      applyFilters(false);
+    }}
+
+    async function handleRawImageClick(event, eid) {{
+      const img = event.currentTarget;
+      const rect = img.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      const fx = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+      const fy = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
+      const reticle = document.getElementById('reticle-' + eid);
+      if (reticle) {{
+        reticle.style.left = (fx * 100).toFixed(1) + '%';
+        reticle.style.top = (fy * 100).toFixed(1) + '%';
+      }}
+      const layoutPos = document.getElementById('edit-layout-' + eid)?.value || 'auto';
+      setEditStatus(eid, '⏳ Re-cropping & rendering 4:5 cover at (' + fx.toFixed(2) + ', ' + fy.toFixed(2) + ')...', false);
+      try {{
+        const res = await postPressroomApi('/api/dispatch/' + eid + '/recrop', {{
+          crop_focus_x: Number(fx.toFixed(3)),
+          crop_focus_y: Number(fy.toFixed(3)),
+          layout_position: layoutPos
+        }});
+        applyUpdatedRecordToDOM(eid, res.record, res.counts_by_state, res.cache_bust);
+        setEditStatus(eid, '✓ Re-rendered cover at focus (' + fx.toFixed(2) + ', ' + fy.toFixed(2) + ') — click Slide 1 to inspect', false);
+      }} catch (err) {{
+        setEditStatus(eid, '✗ Re-crop failed: ' + err.message, true);
+      }}
+    }}
+
+    async function quickSetLayout(eid, pos) {{
+      const fx = parseFloat(document.getElementById('edit-focus-x-' + eid)?.value || '0.5');
+      const fy = parseFloat(document.getElementById('edit-focus-y-' + eid)?.value || '0.5');
+      setEditStatus(eid, '⏳ Rendering cover with layout=' + pos + '...', false);
+      try {{
+        const res = await postPressroomApi('/api/dispatch/' + eid + '/recrop', {{
+          layout_position: pos,
+          crop_focus_x: fx,
+          crop_focus_y: fy
+        }});
+        applyUpdatedRecordToDOM(eid, res.record, res.counts_by_state, res.cache_bust);
+        switchView(eid, 'cover');
+        setEditStatus(eid, '✓ Updated cover layout to ' + pos, false);
+      }} catch (err) {{
+        setEditStatus(eid, '✗ Layout update failed: ' + err.message, true);
+      }}
+    }}
+
+    async function saveDispatchDraft(eid) {{
+      const payload = {{
+        headline: document.getElementById('edit-headline-' + eid)?.value || '',
+        caption: document.getElementById('edit-caption-' + eid)?.value || '',
+        section: document.getElementById('edit-section-' + eid)?.value || 'Local Affairs',
+        character_label: document.getElementById('edit-char-' + eid)?.value || '',
+        camera_stamp: document.getElementById('edit-stamp-' + eid)?.value || '',
+        layout_position: document.getElementById('edit-layout-' + eid)?.value || 'auto',
+        crop_focus_x: parseFloat(document.getElementById('edit-focus-x-' + eid)?.value || '0.5'),
+        crop_focus_y: parseFloat(document.getElementById('edit-focus-y-' + eid)?.value || '0.5')
+      }};
+      setEditStatus(eid, '⏳ Saving draft & rendering cover...', false);
+      try {{
+        const res = await postPressroomApi('/api/dispatch/' + eid + '/draft', payload);
+        applyUpdatedRecordToDOM(eid, res.record, res.counts_by_state, res.cache_bust);
+        setEditStatus(eid, '✓ Saved & rendered (' + res.record.state.toUpperCase() + ')', false);
+      }} catch (err) {{
+        setEditStatus(eid, '✗ ' + err.message, true);
+      }}
+    }}
+
+    async function promptHoldDispatch(eid) {{
+      const reason = window.prompt('Enter hold reason for ' + eid + ':', 'Held from Pressroom review.');
+      if (reason === null) return;
+      setEditStatus(eid, '⏳ Placing dispatch on hold...', false);
+      try {{
+        const res = await postPressroomApi('/api/dispatch/' + eid + '/hold', {{ reason: reason || 'Held from Pressroom review.' }});
+        applyUpdatedRecordToDOM(eid, res.record, res.counts_by_state, res.cache_bust);
+        setEditStatus(eid, '✓ Dispatch placed on HOLD', false);
+      }} catch (err) {{
+        setEditStatus(eid, '✗ Hold failed: ' + err.message, true);
+        window.alert('Hold failed: ' + err.message);
+      }}
+    }}
+
+    async function unholdDispatch(eid) {{
+      setEditStatus(eid, '⏳ Validating & restoring dispatch to READY...', false);
+      try {{
+        const res = await postPressroomApi('/api/dispatch/' + eid + '/unhold', {{}});
+        applyUpdatedRecordToDOM(eid, res.record, res.counts_by_state, res.cache_bust);
+        setEditStatus(eid, '✓ Restored to ' + res.record.state.toUpperCase(), false);
+      }} catch (err) {{
+        setEditStatus(eid, '✗ Cannot unhold: ' + err.message, true);
+        window.alert('Cannot unhold ' + eid + ':\n' + err.message);
       }}
     }}
   </script>
@@ -4227,14 +4808,120 @@ def _get_tailscale_urls(port: int) -> Dict[str, Optional[str]]:
     }
 
 
+def handle_pressroom_api_action(
+    path: str,
+    payload: Optional[Dict[str, Any]] = None,
+    env_override: Optional[Dict[str, str]] = None,
+    repo_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """
+    Handle two-way interactive Pressroom studio POST requests:
+    - `POST /api/dispatch/<event_id>/draft`
+    - `POST /api/dispatch/<event_id>/recrop`
+    - `POST /api/dispatch/<event_id>/hold`
+    - `POST /api/dispatch/<event_id>/unhold`
+    """
+    config = load_config(env_override=env_override, repo_dir=repo_dir)
+    body = payload or {}
+    clean_path = path.split("?", 1)[0].strip().rstrip("/")
+    m = re.match(r"^/api/dispatch/(evt-[a-f0-9]+)/(draft|recrop|hold|unhold)$", clean_path)
+    if not m:
+        return {
+            "ok": False,
+            "error_type": "NotFoundError",
+            "error": f"Unsupported Pressroom API endpoint: {clean_path}",
+        }
+    event_id, action = m.group(1), m.group(2)
+    try:
+        if action == "draft":
+            rec = draft_dispatch(
+                event_id=event_id,
+                headline=str(body.get("headline") or ""),
+                caption=str(body.get("caption") or ""),
+                section=str(body.get("section") or "Local Affairs"),
+                character_label=str(body.get("character_label") or "").strip() or None,
+                camera_stamp=str(body.get("camera_stamp") or "").strip() or None,
+                layout_position=str(body.get("layout_position") or "auto"),
+                crop_focus_x=float(body["crop_focus_x"]) if body.get("crop_focus_x") is not None else None,
+                crop_focus_y=float(body["crop_focus_y"]) if body.get("crop_focus_y") is not None else None,
+                auto_render_cover=True,
+                env_override=env_override,
+                repo_dir=repo_dir,
+            )
+        elif action == "recrop":
+            rec = render_dispatch_cover(
+                event_id=event_id,
+                layout_position=str(body.get("layout_position") or "").strip() or None,
+                crop_focus_x=float(body["crop_focus_x"]) if body.get("crop_focus_x") is not None else None,
+                crop_focus_y=float(body["crop_focus_y"]) if body.get("crop_focus_y") is not None else None,
+                env_override=env_override,
+                repo_dir=repo_dir,
+            )
+        elif action == "hold":
+            rec = hold_dispatch(
+                event_id=event_id,
+                reason=str(body.get("reason") or "Held from Pressroom review."),
+                is_empty_frame=body.get("is_empty_frame"),
+                env_override=env_override,
+                repo_dir=repo_dir,
+            )
+        elif action == "unhold":
+            rec = unhold_dispatch(
+                event_id=event_id,
+                env_override=env_override,
+                repo_dir=repo_dir,
+            )
+        else:
+            raise WildlifeDeskError(f"Unknown action: {action}")
+
+        press_res = build_pressroom(start_server=False, env_override=env_override, repo_dir=repo_dir)
+        return {
+            "ok": True,
+            "action": action,
+            "event_id": event_id,
+            "record": rec,
+            "counts_by_state": press_res["counts_by_state"],
+            "cache_bust": int(time.time() * 1000),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error_type": exc.__class__.__name__,
+            "error": redact_secrets(str(exc), config),
+        }
+
+
 def _run_range_http_server(serve_dir: Path, port: int) -> None:
-    """Run a threaded HTTP server with HTTP Range (`206 Partial Content`) support for MP4 video playback."""
+    """Run a threaded HTTP server with HTTP Range (`206 Partial Content`) support and Pressroom Studio API."""
     import http.server
     import socketserver
 
     class RangeHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, directory=str(serve_dir), **kwargs)
+
+        def end_headers(self) -> None:
+            if not self.path.endswith(".mp4"):
+                self.send_header("Cache-Control", "no-cache")
+            super().end_headers()
+
+        def do_POST(self) -> None:
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+                raw_body = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
+                payload = json.loads(raw_body) if raw_body.strip() else {}
+            except Exception as exc:
+                payload = {}
+                res = {"ok": False, "error_type": "BadRequest", "error": f"Invalid JSON body: {exc}"}
+            else:
+                res = handle_pressroom_api_action(self.path, payload)
+
+            resp_bytes = json.dumps(res).encode("utf-8")
+            self.send_response(200 if res.get("ok") else 400)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(resp_bytes)))
+            self.end_headers()
+            self.wfile.write(resp_bytes)
 
         def send_head(self) -> Any:
             path = self.translate_path(self.path)

@@ -539,3 +539,93 @@ def test_schedule_interleaving_and_drip_publish(tmp_path: Path):
     assert pub_res["event_id"] == sched["slots"][0]["event_id"]
 
 
+def test_interactive_pressroom_api_actions(tmp_path: Path):
+    """
+    Verify two-way Pressroom Studio API endpoints (`/draft`, `/recrop`, `/hold`, `/unhold`)
+    and interactive UI controls in `index.html`.
+    """
+    env = _make_test_env(tmp_path)
+    sel_dir = Path(env["LOCAL_WILDLIFE_DIR"])
+    _create_image_with_meta(
+        sel_dir, "FOX_001.jpg", color=(40, 50, 60), capture_time="2026-11-02T04:15:00", tz_known=False
+    )
+
+    disc = wildlife_desk.discover_sightings(env_override=env)
+    eid = disc["created_event_ids"][0]
+    rec = wildlife_desk.load_dispatch_record(eid, env_override=env)
+    wildlife_desk.record_observations(
+        event_id=eid,
+        observations=[
+            {
+                "claim": "One gray fox is visible crossing the clearing in infrared mode.",
+                "source_asset_ids": rec["source"]["asset_ids"],
+                "species": "fox",
+                "certainty": "confirmed",
+            }
+        ],
+        contains_people=False,
+        contains_identifying_property=False,
+        env_override=env,
+    )
+
+    # 1. Draft via Pressroom API
+    draft_res = wildlife_desk.handle_pressroom_api_action(
+        f"/api/dispatch/{eid}/draft",
+        {
+            "headline": "GRAY FOX CROSSES LOWER CLEARING DURING NIGHT SHIFT",
+            "caption": "A gray fox crossed the lower clearing in infrared mode without pausing at the stake.",
+            "section": "The Night Shift",
+            "character_label": "Fox #1",
+            "camera_stamp": "11/02/2026 04:15:00 • 11°C / 52°F",
+            "layout_position": "bottom-left",
+            "crop_focus_x": 0.42,
+            "crop_focus_y": 0.58,
+        },
+        env_override=env,
+    )
+    assert draft_res["ok"] is True
+    assert draft_res["record"]["state"] == "ready"
+    assert draft_res["record"]["production"]["layout_position"] == "bottom-left"
+    assert draft_res["record"]["production"]["crop_focus_x"] == pytest.approx(0.42)
+    assert "Camera Stamp: 11/02/2026 04:15:00 • 11°C / 52°F" in draft_res["record"]["editorial"]["caption"]
+
+    # 2. Re-crop via Pressroom API (simulating click on raw frame)
+    recrop_res = wildlife_desk.handle_pressroom_api_action(
+        f"/api/dispatch/{eid}/recrop",
+        {"crop_focus_x": 0.68, "crop_focus_y": 0.34, "layout_position": "top-left"},
+        env_override=env,
+    )
+    assert recrop_res["ok"] is True
+    assert recrop_res["record"]["production"]["crop_focus_x"] == pytest.approx(0.68)
+    assert recrop_res["record"]["production"]["crop_focus_y"] == pytest.approx(0.34)
+    assert recrop_res["record"]["production"]["layout_position"] == "top-left"
+
+    # 3. Hold via Pressroom API
+    hold_res = wildlife_desk.handle_pressroom_api_action(
+        f"/api/dispatch/{eid}/hold",
+        {"reason": "Saving for next week's edition."},
+        env_override=env,
+    )
+    assert hold_res["ok"] is True
+    assert hold_res["record"]["state"] == "held"
+    assert hold_res["counts_by_state"]["held"] == 1
+
+    # 4. Unhold back to ready via Pressroom API
+    unhold_res = wildlife_desk.handle_pressroom_api_action(
+        f"/api/dispatch/{eid}/unhold",
+        {},
+        env_override=env,
+    )
+    assert unhold_res["ok"] is True
+    assert unhold_res["record"]["state"] == "ready"
+    assert unhold_res["counts_by_state"]["ready"] == 1
+
+    # 5. Verify interactive controls are rendered in Pressroom HTML
+    html_path = Path(env["OUTPUT_DIR"]) / "pressroom" / "index.html"
+    html_text = html_path.read_text(encoding="utf-8")
+    assert f"handleRawImageClick(event, '{eid}')" in html_text
+    assert f"saveDispatchDraft('{eid}')" in html_text
+    assert f"reticle-{eid}" in html_text
+
+
+
