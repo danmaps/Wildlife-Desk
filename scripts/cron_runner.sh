@@ -56,10 +56,10 @@ if [[ "${DISCOVERED_COUNT}" -gt 0 ]]; then
     fi
 fi
 
-# 3. Fixed-Schedule Drip Publish (Tue / Thu / Sat @ 08:00 local time, 36h cooldown)
+# 3. Fixed-Schedule Drip Publish (Tue / Thu / Sat @ 09:00 local time, 20h cooldown)
 DRIP_DAYS="${DRIP_SCHEDULE_DAYS:-tue,thu,sat}"
-DRIP_HOUR="${DRIP_SCHEDULE_HOUR:-8}"
-DRIP_COOLDOWN="${DRIP_COOLDOWN_HOURS:-36}"
+DRIP_HOUR="${DRIP_SCHEDULE_HOUR:-9}"
+DRIP_COOLDOWN="${DRIP_COOLDOWN_HOURS:-20}"
 
 DRIP_OUT="$("${PYTHON_BIN}" "${CLI}" drip-publish --days "${DRIP_DAYS}" --hour "${DRIP_HOUR}" --cooldown-hours "${DRIP_COOLDOWN}")"
 echo "[$(date -Iseconds)] Drip publish result: ${DRIP_OUT}"

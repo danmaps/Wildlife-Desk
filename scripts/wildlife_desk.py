@@ -31,6 +31,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from PIL import ExifTags, Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
@@ -208,6 +209,8 @@ def load_config(env_override: Optional[Dict[str, str]] = None, repo_dir: Optiona
         "max_model_calls_per_run": int(get_val("MAX_MODEL_CALLS_PER_RUN", "10") or "10"),
         "max_model_cost_per_run_usd": float(get_val("MAX_MODEL_COST_PER_RUN_USD", "1.00") or "1.00"),
         "timezone": get_val("TIMEZONE", "UTC").strip() or "UTC",
+        "drip_schedule_hour": int(get_val("DRIP_SCHEDULE_HOUR", "8") or "8"),
+        "drip_cooldown_hours": float(get_val("DRIP_COOLDOWN_HOURS", "36.0") or "36.0"),
         "state_dir": str(state_dir),
         "output_dir": str(output_dir),
         "local_server_port": local_server_port,
@@ -3063,19 +3066,33 @@ def _parse_schedule_weekdays(raw_days: str = "tue,thu,sat") -> List[int]:
     return sorted(days) if days else [1, 3, 5]
 
 
+def _newsroom_tz() -> dt.tzinfo:
+    tz_name = os.environ.get("WILDLIFE_DESK_TZ", "America/Los_Angeles").strip() or "America/Los_Angeles"
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return dt.timezone.utc
+
+
 def compute_publication_schedule(
     schedule_days: str = "tue,thu,sat",
-    schedule_hour_local: int = 8,
-    min_hours_between_posts: float = 36.0,
+    schedule_hour_local: Optional[int] = None,
+    min_hours_between_posts: Optional[float] = None,
     now_dt: Optional[dt.datetime] = None,
     env_override: Optional[Dict[str, str]] = None,
     repo_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
     Compute the ordered multi-week publication schedule for all `ready` dispatches
-    on fixed days of the week (default: Tue / Thu / Sat at 08:00 local time),
-    interleaving species whenever possible so consecutive posts vary species.
+    on fixed days of the week (default: Tue / Thu / Sat at 09:00 local time),
+    honoring explicit `schedule_priority` first and interleaving species whenever possible.
     """
+    cfg = load_config(env_override=env_override, repo_dir=repo_dir)
+    if schedule_hour_local is None:
+        schedule_hour_local = int(cfg.get("drip_schedule_hour", 8))
+    if min_hours_between_posts is None:
+        min_hours_between_posts = float(cfg.get("drip_cooldown_hours", 36.0))
+
     listed = list_dispatches(env_override=env_override, repo_dir=repo_dir)["dispatches"]
     ready_list = [r for r in listed if r.get("state") == "ready"]
     published_list = [r for r in listed if r.get("state") == "published"]
@@ -3083,6 +3100,7 @@ def compute_publication_schedule(
     ready_sorted = sorted(
         ready_list,
         key=lambda r: (
+            int(r.get("schedule_priority", 100)),
             str((r.get("source") or {}).get("capture_time") or ""),
             str(r.get("event_id") or ""),
         ),
@@ -3104,9 +3122,12 @@ def compute_publication_schedule(
             except Exception:
                 pass
 
-    remaining = list(ready_sorted)
-    ordered_ready: List[Dict[str, Any]] = []
-    prev_sp = last_species
+    # Keep explicitly pinned dispatches (`schedule_priority < 100`) at the front in priority order,
+    # then interleave remaining standard dispatches by species.
+    pinned_ready = [r for r in ready_sorted if int(r.get("schedule_priority", 100)) < 100]
+    remaining = [r for r in ready_sorted if int(r.get("schedule_priority", 100)) >= 100]
+    ordered_ready: List[Dict[str, Any]] = list(pinned_ready)
+    prev_sp = _primary_species(ordered_ready[-1]) if ordered_ready else last_species
     while remaining:
         diff_idx = next(
             (i for i, r in enumerate(remaining) if _primary_species(r) != prev_sp),
@@ -3117,9 +3138,10 @@ def compute_publication_schedule(
         prev_sp = _primary_species(chosen)
 
     weekdays = _parse_schedule_weekdays(schedule_days)
-    local_now = now_dt if now_dt is not None else dt.datetime.now().astimezone()
+    target_tz = _newsroom_tz()
+    local_now = now_dt if now_dt is not None else dt.datetime.now(target_tz)
     if local_now.tzinfo is None:
-        local_now = local_now.astimezone()
+        local_now = local_now.replace(tzinfo=target_tz)
     cursor_date = local_now.date()
 
     slots: List[Dict[str, Any]] = []
@@ -3179,8 +3201,8 @@ def drip_publish(
     force: bool = False,
     dry_run: bool = False,
     schedule_days: str = "tue,thu,sat",
-    schedule_hour_local: int = 8,
-    min_hours_between_posts: float = 36.0,
+    schedule_hour_local: Optional[int] = None,
+    min_hours_between_posts: Optional[float] = None,
     now_dt: Optional[dt.datetime] = None,
     env_override: Optional[Dict[str, str]] = None,
     repo_dir: Optional[Path] = None,
@@ -3190,6 +3212,12 @@ def drip_publish(
     at most ONE `ready` dispatch (interleaved by species).
     Requires zero AI tokens. Safe to invoke from cron multiple times per day.
     """
+    cfg = load_config(env_override=env_override, repo_dir=repo_dir)
+    if schedule_hour_local is None:
+        schedule_hour_local = int(cfg.get("drip_schedule_hour", 8))
+    if min_hours_between_posts is None:
+        min_hours_between_posts = float(cfg.get("drip_cooldown_hours", 36.0))
+
     sched = compute_publication_schedule(
         schedule_days=schedule_days,
         schedule_hour_local=schedule_hour_local,
@@ -3205,9 +3233,10 @@ def drip_publish(
             "schedule": sched,
         }
 
-    local_now = now_dt if now_dt is not None else dt.datetime.now().astimezone()
+    target_tz = _newsroom_tz()
+    local_now = now_dt if now_dt is not None else dt.datetime.now(target_tz)
     if local_now.tzinfo is None:
-        local_now = local_now.astimezone()
+        local_now = local_now.replace(tzinfo=target_tz)
     weekdays = _parse_schedule_weekdays(schedule_days)
 
     if not force:
@@ -3224,7 +3253,7 @@ def drip_publish(
                 "next_slot": sched["slots"][0],
             }
         if sched["last_published_at"]:
-            last_dt = dt.datetime.fromisoformat(sched["last_published_at"].replace("Z", "+00:00")).astimezone()
+            last_dt = dt.datetime.fromisoformat(sched["last_published_at"].replace("Z", "+00:00")).astimezone(local_now.tzinfo)
             elapsed_h = (local_now - last_dt).total_seconds() / 3600.0
             if elapsed_h < min_hours_between_posts:
                 return {
@@ -5536,8 +5565,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Show the upcoming Tue/Thu/Sat publication schedule for all READY dispatches",
     )
     p_sched.add_argument("--days", default="tue,thu,sat", help="Comma-separated weekdays (default: tue,thu,sat)")
-    p_sched.add_argument("--hour", type=int, default=8, help="Local hour of day (default: 8)")
-    p_sched.add_argument("--cooldown-hours", type=float, default=36.0, help="Minimum hours between posts (default: 36)")
+    p_sched.add_argument("--hour", type=int, default=None, help="Local hour of day (default: DRIP_SCHEDULE_HOUR or 9)")
+    p_sched.add_argument("--cooldown-hours", type=float, default=None, help="Minimum hours between posts (default: DRIP_COOLDOWN_HOURS or 20)")
 
     p_drip = sub.add_parser(
         "drip-publish",
@@ -5546,8 +5575,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_drip.add_argument("--force", action="store_true", help="Publish next READY dispatch immediately regardless of day/cooldown")
     p_drip.add_argument("--dry-run", action="store_true", help="Validate without posting to Instagram")
     p_drip.add_argument("--days", default="tue,thu,sat", help="Comma-separated weekdays (default: tue,thu,sat)")
-    p_drip.add_argument("--hour", type=int, default=8, help="Local hour of day (default: 8)")
-    p_drip.add_argument("--cooldown-hours", type=float, default=36.0, help="Minimum hours between posts (default: 36)")
+    p_drip.add_argument("--hour", type=int, default=None, help="Local hour of day (default: DRIP_SCHEDULE_HOUR or 9)")
+    p_drip.add_argument("--cooldown-hours", type=float, default=None, help="Minimum hours between posts (default: DRIP_COOLDOWN_HOURS or 20)")
 
     p_synth = sub.add_parser(
         "init-synthetic-demo",

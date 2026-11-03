@@ -29,6 +29,8 @@ def _make_test_env(tmp_path: Path, **overrides) -> dict:
         "OUTPUT_DIR": str(tmp_path / "output"),
         "PUBLISH_ENABLED": "false",
         "BURST_WINDOW_SECONDS": "180",
+        "DRIP_SCHEDULE_HOUR": "8",
+        "DRIP_COOLDOWN_HOURS": "36.0",
     }
     env.update(overrides)
     return env
