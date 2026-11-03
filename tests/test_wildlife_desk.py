@@ -628,4 +628,84 @@ def test_interactive_pressroom_api_actions(tmp_path: Path):
     assert f"reticle-{eid}" in html_text
 
 
+def test_create_digest_dispatch_and_multi_slide_publish(tmp_path: Path):
+    """
+    Verify `create_digest_dispatch` bundles multiple sightings into a single multi-slide
+    Digest Carousel (`Weekend Edition` / `Developing Story`), archives secondary events,
+    renders multi-slide tabs in the Pressroom, and publishes as a multi-slide CAROUSEL.
+    """
+    env = _make_test_env(
+        tmp_path,
+        PUBLISH_ENABLED="true",
+        INSTAGRAM_ACCOUNT_ID="local-test-receipt",
+        INSTAGRAM_ACCESS_TOKEN="secret-ig-token",
+    )
+    sel_dir = Path(env["LOCAL_WILDLIFE_DIR"])
+    _create_image_with_meta(sel_dir, "PASS_1.jpg", color=(25, 35, 45), capture_time="2026-11-02T02:10:00", tz_known=False)
+    _create_image_with_meta(sel_dir, "PASS_2.jpg", color=(45, 55, 65), capture_time="2026-11-02T02:14:00", tz_known=False)
+    _create_image_with_meta(sel_dir, "PASS_3.jpg", color=(65, 75, 85), capture_time="2026-11-02T02:19:00", tz_known=False)
+
+    disc = wildlife_desk.discover_sightings(env_override=env)
+    eids = [s["event_id"] for s in disc["sightings"]]
+    assert len(eids) == 3
+
+    for idx, eid in enumerate(eids, start=1):
+        rec = wildlife_desk.load_dispatch_record(eid, env_override=env)
+        wildlife_desk.record_observations(
+            event_id=eid,
+            observations=[
+                {
+                    "claim": f"Pass #{idx}: One coyote is visible crossing the clearing in infrared mode.",
+                    "source_asset_ids": rec["source"]["asset_ids"],
+                    "species": "coyote",
+                    "certainty": "confirmed",
+                }
+            ],
+            contains_people=False,
+            contains_identifying_property=False,
+            env_override=env,
+        )
+
+    digest = wildlife_desk.create_digest_dispatch(
+        event_ids=eids,
+        primary_event_id=eids[1],
+        headline="THREE OVERNIGHT COYOTE PASSES LOGGED ACROSS TEN-MINUTE WINDOW",
+        caption=(
+            "Three separate infrared captures between 02:10 and 02:19 recorded a coyote "
+            "approaching the tree line, pausing in the central clearing, and departing along the margin."
+        ),
+        section="Developing Story",
+        camera_stamps={
+            eids[0]: "11/02/2026 02:10:00 • 14°C / 57°F",
+            eids[1]: "11/02/2026 02:14:00 • 14°C / 57°F",
+            eids[2]: "11/02/2026 02:19:00 • 14°C / 57°F",
+        },
+        env_override=env,
+    )
+    assert digest["state"] == "ready"
+    assert digest["production"]["post_format"] == "digest_carousel"
+    assert len(digest["production"]["carousel_slides"]) == 4  # 1 Cover + 3 Constituent Slides
+    assert "Camera Stamps:" in digest["editorial"]["caption"]
+
+    # Secondary events should be hidden from the main queue
+    listed = wildlife_desk.list_dispatches(env_override=env)
+    assert listed["total_count"] == 1
+    assert listed["dispatches"][0]["event_id"] == eids[1]
+
+    # Pressroom should render multi-slide tabs for Slide 2, Slide 3, Slide 4
+    press = wildlife_desk.build_pressroom(start_server=False, env_override=env)
+    html_text = Path(press["pressroom_html_path"]).read_text(encoding="utf-8")
+    assert "DIGEST CAROUSEL (4 SLIDES)" in html_text
+    assert f"switchView('{eids[1]}', 'slide2')" in html_text
+    assert f"switchView('{eids[1]}', 'slide3')" in html_text
+    assert f"switchView('{eids[1]}', 'slide4')" in html_text
+
+    # Publishing should record a 4-slide CAROUSEL receipt
+    pub = wildlife_desk.publish_dispatch(eids[1], env_override=env)
+    assert pub["state"] == "published"
+    assert pub["publication"]["post_type"] == "CAROUSEL"
+    assert pub["publication"]["slide_count"] == 4
+
+
+
 

@@ -251,6 +251,42 @@ def attach_video_to_dispatch(
 
 
 @mcp.tool()
+def create_digest_dispatch(
+    event_ids: List[str],
+    headline: str,
+    caption: str,
+    section: str = "Weekend Edition",
+    primary_event_id: Optional[str] = None,
+    character_label: Optional[str] = None,
+    camera_stamps: Optional[Dict[str, str]] = None,
+    layout_position: str = "auto",
+    crop_focus_x: Optional[float] = None,
+    crop_focus_y: Optional[float] = None,
+) -> str:
+    """
+    Bundle 2-9 related sighting events into a single multi-slide Digest Carousel
+    dispatch (`'Weekend Edition'` or `'Developing Story'`, up to 10 total Instagram slides:
+    Slide 1 = 1080x1350 Front-Page Cover, Slides 2..N = sequential 10s camera videos or
+    4:5 still frames from each constituent event).
+    Marks secondary constituent events with `source.merged_into_event_id` so they are
+    archived and never double-posted.
+    """
+    return _safe_json_response(
+        wildlife_desk.create_digest_dispatch,
+        event_ids=event_ids,
+        headline=headline,
+        caption=caption,
+        section=section,
+        primary_event_id=primary_event_id,
+        character_label=character_label,
+        camera_stamps=camera_stamps,
+        layout_position=layout_position,
+        crop_focus_x=crop_focus_x,
+        crop_focus_y=crop_focus_y,
+    )
+
+
+@mcp.tool()
 def hold_dispatch(
     event_id: str,
     reason: str,

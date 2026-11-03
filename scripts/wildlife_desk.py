@@ -1111,7 +1111,10 @@ def list_dispatches(
             rec = json.loads(p.read_text(encoding="utf-8"))
         except Exception:
             continue
-        if not include_paired_companions and (rec.get("source") or {}).get("paired_into_event_id"):
+        src_obj = rec.get("source") or {}
+        if not include_paired_companions and (
+            src_obj.get("paired_into_event_id") or src_obj.get("merged_into_event_id")
+        ):
             continue
         st = rec.get("state", "discovered")
         counts_by_state[st] = counts_by_state.get(st, 0) + 1
@@ -1938,6 +1941,7 @@ def render_dispatch_cover(
     output_sha256 = hashlib.sha256(cover_path.read_bytes()).hexdigest()
 
     prev_prod = record.get("production") or {}
+    prev_slides = prev_prod.get("carousel_slides")
     video_path = prev_prod.get("video_path")
     if not video_path:
         for asset in record["source"].get("assets", []):
@@ -1947,12 +1951,19 @@ def render_dispatch_cover(
                     video_path = str(cand_vid)
                     break
 
+    if isinstance(prev_slides, list) and len(prev_slides) >= 2:
+        prev_slides[0]["path"] = str(cover_path)
+        resolved_format = "digest_carousel" if len(prev_slides) > 2 or prev_prod.get("post_format") == "digest_carousel" else "carousel_video"
+    else:
+        prev_slides = None
+        resolved_format = "carousel_video" if video_path else "single_image"
+
     record["production"] = {
         "cover_path": str(cover_path),
         "square_preview_path": str(square_path),
         "thumb_preview_path": str(thumb_path),
         "video_path": video_path,
-        "post_format": "carousel_video" if video_path else "single_image",
+        "post_format": resolved_format,
         "layout_position": pos,
         "crop_focus_x": fx,
         "crop_focus_y": fy,
@@ -1963,6 +1974,8 @@ def render_dispatch_cover(
         "template_version": RENDERER_TEMPLATE_VERSION,
         "rendered_at": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
+    if prev_slides:
+        record["production"]["carousel_slides"] = prev_slides
 
     _recompute_eligibility(record, env_override=env_override, repo_dir=repo_dir)
     if record["eligibility"]["publishable"]:
@@ -2197,6 +2210,224 @@ def pair_all_photo_video_companions(
     return {"paired_count": len(paired_map), "pairs": paired_map}
 
 
+def create_digest_dispatch(
+    event_ids: List[str],
+    headline: str,
+    caption: str,
+    section: str = "Weekend Edition",
+    primary_event_id: Optional[str] = None,
+    character_label: Optional[str] = None,
+    camera_stamps: Optional[Dict[str, str]] = None,
+    layout_position: str = "auto",
+    crop_focus_x: Optional[float] = None,
+    crop_focus_y: Optional[float] = None,
+    env_override: Optional[Dict[str, str]] = None,
+    repo_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """
+    Bundle 2–9 related sighting events into a single multi-slide Digest Carousel
+    dispatch (`Weekend Edition` or `Developing Story`, up to 10 total Instagram slides:
+    Slide 1 = 1080x1350 Front-Page Cover, Slides 2..N = sequential 10s camera videos or
+    4:5 still frames from each constituent event).
+    Marks secondary constituent events with `source.merged_into_event_id` so they are
+    archived and never double-posted.
+    """
+    config = load_config(env_override=env_override, repo_dir=repo_dir)
+    dirs = ensure_runtime_dirs(config)
+
+    clean_eids: List[str] = []
+    for raw_eid in event_ids or []:
+        s_eid = str(raw_eid or "").strip()
+        if s_eid and s_eid not in clean_eids:
+            clean_eids.append(s_eid)
+
+    if len(clean_eids) < 2 or len(clean_eids) > 9:
+        raise WildlifeDeskError(
+            f"create_digest_dispatch requires between 2 and 9 sighting event_ids (got {len(clean_eids)})."
+        )
+
+    primary_eid = (
+        primary_event_id.strip()
+        if (primary_event_id and primary_event_id.strip() in clean_eids)
+        else clean_eids[0]
+    )
+
+    records_by_eid: Dict[str, Dict[str, Any]] = {}
+    for eid in clean_eids:
+        rec = load_dispatch_record(eid, env_override=env_override, repo_dir=repo_dir)
+        if rec.get("state") == "published":
+            raise WildlifeDeskError(f"Cannot merge already-published dispatch {eid} into a digest.")
+        priv = rec.get("privacy_screening") or {}
+        if priv.get("contains_people") is True or priv.get("contains_identifying_property") is True:
+            raise ValidationHoldError(
+                f"Cannot include privacy-held sighting {eid} in a digest carousel."
+            )
+        if priv.get("is_empty_frame") is True:
+            raise ValidationHoldError(
+                f"Cannot include empty frame {eid} in a digest carousel."
+            )
+        if not priv.get("evaluated"):
+            rec["privacy_screening"] = {
+                "evaluated": True,
+                "contains_people": False,
+                "contains_identifying_property": False,
+                "is_empty_frame": False,
+                "notes": "Evaluated during multi-sighting digest assembly.",
+            }
+            _save_dispatch_record(dirs["dispatches"] / f"{eid}.json", rec, config)
+        records_by_eid[eid] = rec
+
+    primary_rec = records_by_eid[primary_eid]
+    primary_out_dir = dirs["output"] / primary_eid
+    primary_out_dir.mkdir(parents=True, exist_ok=True)
+
+    merged_asset_ids: List[str] = list(primary_rec.get("source", {}).get("asset_ids") or [])
+    merged_assets: List[Dict[str, Any]] = list(primary_rec.get("source", {}).get("assets") or [])
+    merged_observations: List[Dict[str, Any]] = list(primary_rec.get("observations") or [])
+
+    carousel_slides: List[Dict[str, Any]] = [
+        {
+            "slide_number": 1,
+            "kind": "cover",
+            "event_id": primary_eid,
+            "label": "Slide 1: 4:5 Front-Page Cover",
+            "path": None,
+        }
+    ]
+    stamps_in_order: List[str] = []
+
+    for idx, eid in enumerate(clean_eids, start=2):
+        # Ensure any companion video is paired & cached
+        vid_path = ensure_event_video_cached(eid, env_override=env_override, repo_dir=repo_dir)
+        if vid_path is None:
+            comp_eid = find_companion_video_event(eid, env_override=env_override, repo_dir=repo_dir)
+            if comp_eid:
+                attach_video_to_dispatch(eid, video_event_id=comp_eid, env_override=env_override, repo_dir=repo_dir)
+                vid_path = ensure_event_video_cached(eid, env_override=env_override, repo_dir=repo_dir)
+
+        rec_i = load_dispatch_record(eid, env_override=env_override, repo_dir=repo_dir)
+        records_by_eid[eid] = rec_i
+
+        for a_item in (rec_i.get("source") or {}).get("assets") or []:
+            aid = a_item.get("asset_id")
+            if aid and aid not in merged_asset_ids:
+                merged_asset_ids.append(aid)
+            if aid and not any(x.get("asset_id") == aid for x in merged_assets):
+                merged_assets.append(dict(a_item))
+
+        for obs_item in rec_i.get("observations") or []:
+            if obs_item not in merged_observations:
+                merged_observations.append(dict(obs_item))
+
+        stamp_i = (
+            (camera_stamps or {}).get(eid)
+            or (rec_i.get("editorial") or {}).get("camera_stamp")
+            or (rec_i.get("source") or {}).get("camera_stamp")
+            or (rec_i.get("source") or {}).get("capture_time")
+            or eid
+        )
+        stamp_i = str(stamp_i).strip()
+        rec_i.setdefault("source", {})["camera_stamp"] = stamp_i
+        stamps_in_order.append(stamp_i)
+        short_stamp = stamp_i.split("•")[0].strip()
+
+        raw_assets_i = (rec_i.get("source") or {}).get("assets") or []
+        preview_path = raw_assets_i[0].get("cached_preview_path") if raw_assets_i else None
+
+        if vid_path and vid_path.exists():
+            carousel_slides.append(
+                {
+                    "slide_number": idx,
+                    "kind": "video",
+                    "event_id": eid,
+                    "path": str(vid_path),
+                    "poster_path": preview_path,
+                    "camera_stamp": stamp_i,
+                    "label": f"▶ Slide {idx}: Clip {idx - 1} ({short_stamp})",
+                }
+            )
+        elif preview_path and Path(preview_path).exists():
+            slide_img_path = primary_out_dir / f"digest-slide-{idx}.jpg"
+            with Image.open(preview_path) as raw_im:
+                rgb_im = ImageOps.exif_transpose(raw_im).convert("RGB")
+            cropped_im = _crop_to_aspect_focus(
+                rgb_im,
+                1080,
+                1350,
+                0.5,
+                0.5,
+                trim_bottom_hud=True,
+            )
+            cropped_im.save(slide_img_path, format="JPEG", quality=92, optimize=True)
+            carousel_slides.append(
+                {
+                    "slide_number": idx,
+                    "kind": "image",
+                    "event_id": eid,
+                    "path": str(slide_img_path),
+                    "camera_stamp": stamp_i,
+                    "label": f"Slide {idx}: Frame {idx - 1} ({short_stamp})",
+                }
+            )
+        else:
+            raise WildlifeDeskError(f"Sighting {eid} has neither a cached video nor a preview image for digest slide {idx}.")
+
+    primary_rec = load_dispatch_record(primary_eid, env_override=env_override, repo_dir=repo_dir)
+    primary_rec["source"]["asset_ids"] = merged_asset_ids
+    primary_rec["source"]["assets"] = merged_assets
+    primary_rec["source"]["digest_event_ids"] = clean_eids
+    primary_rec["observations"] = merged_observations
+    primary_rec["uncertainties"] = [
+        u
+        for u in (primary_rec.get("uncertainties") or [])
+        if "single still image cannot establish duration" not in u
+    ]
+
+    composite_stamp = " | ".join(stamps_in_order)
+    stamp_lines = "\n".join(f"• Clip {i + 1}: {s}" for i, s in enumerate(stamps_in_order))
+    full_caption = caption.strip()
+    if "camera stamp" not in full_caption.lower():
+        full_caption = f"{full_caption}\n\nCamera Stamps:\n{stamp_lines}"
+
+    primary_rec["production"]["post_format"] = "digest_carousel"
+    primary_rec["production"]["carousel_slides"] = carousel_slides
+    _save_dispatch_record(dirs["dispatches"] / f"{primary_eid}.json", primary_rec, config)
+
+    # Archive secondary constituent events so they don't appear separately in the queue
+    for eid in clean_eids:
+        if eid == primary_eid:
+            continue
+        sec_path = dirs["dispatches"] / f"{eid}.json"
+        sec_rec = load_dispatch_record(eid, env_override=env_override, repo_dir=repo_dir)
+        sec_rec.setdefault("source", {})["merged_into_event_id"] = primary_eid
+        sec_rec["state"] = "held"
+        sec_rec.setdefault("eligibility", {})["publishable"] = False
+        sec_rec["eligibility"]["hold_reasons"] = [
+            f"Merged into {section} multi-sighting digest carousel {primary_eid}."
+        ]
+        _save_dispatch_record(sec_path, sec_rec, config)
+
+    drafted = draft_dispatch(
+        event_id=primary_eid,
+        headline=headline,
+        caption=full_caption,
+        section=section,
+        character_label=character_label,
+        camera_stamp=composite_stamp,
+        layout_position=layout_position,
+        crop_focus_x=crop_focus_x,
+        crop_focus_y=crop_focus_y,
+        auto_render_cover=True,
+        env_override=env_override,
+        repo_dir=repo_dir,
+    )
+    carousel_slides[0]["path"] = drafted["production"].get("cover_path")
+    drafted["production"]["post_format"] = "digest_carousel"
+    drafted["production"]["carousel_slides"] = carousel_slides
+    _save_dispatch_record(dirs["dispatches"] / f"{primary_eid}.json", drafted, config)
+    return drafted
+
+
 # ---------------------------------------------------------------------------
 # Publishing Gate, Atomic Claims & Timeout Reconciliation
 # ---------------------------------------------------------------------------
@@ -2327,8 +2558,12 @@ def publish_dispatch(
         if ig_account == "local-test-receipt":
             remote_id = f"ig-local-{hashlib.sha256(pub_key.encode('utf-8')).hexdigest()[:10]}"
             published_at = dt.datetime.now(dt.timezone.utc).isoformat()
+            carousel_slides_meta = record["production"].get("carousel_slides") or []
             pub["remote_post_id"] = remote_id
             pub["published_at"] = published_at
+            pub["post_type"] = "CAROUSEL" if (len(carousel_slides_meta) >= 2 or record["production"].get("video_path")) else "IMAGE"
+            if len(carousel_slides_meta) >= 2:
+                pub["slide_count"] = len(carousel_slides_meta)
             pub["reconcile_required"] = False
             pub.setdefault("attempts", []).append(
                 {
@@ -2407,6 +2642,9 @@ def publish_dispatch(
             staged_video_path = stage_dir / staged_video_filename
             public_video_url = f"{stage_base_url}/{staged_video_filename}"
 
+        extra_staged_paths: List[Path] = []
+        carousel_slides = record["production"].get("carousel_slides") or []
+
         # Determine Graph host based on token type (IG... -> graph.instagram.com, EAA... -> graph.facebook.com)
         graph_host = (
             "https://graph.instagram.com/v21.0"
@@ -2418,7 +2656,7 @@ def publish_dispatch(
 
         shutil.copyfile(cover_path, staged_file_path)
         os.chmod(staged_file_path, 0o644)
-        if staged_video_path and video_path:
+        if staged_video_path and video_path and len(carousel_slides) < 2:
             shutil.copyfile(video_path, staged_video_path)
             os.chmod(staged_video_path, 0o644)
 
@@ -2501,7 +2739,69 @@ def publish_dispatch(
 
         try:
             children_ids: List[str] = []
-            if public_video_url and staged_video_path:
+            if len(carousel_slides) >= 2:
+                # Multi-Slide Digest or N-Slide Carousel (2..10 slides)
+                slide1_id = _create_and_wait_container(
+                    {
+                        "image_url": public_image_url,
+                        "is_carousel_item": "true",
+                        "access_token": ig_token,
+                    },
+                    step_label="carousel_slide_1_cover",
+                    max_polls=15,
+                    poll_interval=1.5,
+                )
+                children_ids.append(slide1_id)
+                for sl in carousel_slides[1:10]:
+                    snum = sl.get("slide_number") or (len(children_ids) + 1)
+                    sl_kind = sl.get("kind") or "image"
+                    sl_src = Path(str(sl.get("path") or ""))
+                    if not sl_src.exists():
+                        raise PublicationGateError(f"Carousel slide {snum} file does not exist: {sl_src}")
+                    ext = ".mp4" if sl_kind == "video" else ".jpg"
+                    sl_staged_name = f"wd-{ephemeral_token}-slide{snum}{ext}"
+                    sl_staged_path = stage_dir / sl_staged_name
+                    shutil.copyfile(sl_src, sl_staged_path)
+                    os.chmod(sl_staged_path, 0o644)
+                    extra_staged_paths.append(sl_staged_path)
+                    sl_public_url = f"{stage_base_url}/{sl_staged_name}"
+                    if sl_kind == "video":
+                        child_id = _create_and_wait_container(
+                            {
+                                "media_type": "VIDEO",
+                                "video_url": sl_public_url,
+                                "is_carousel_item": "true",
+                                "access_token": ig_token,
+                            },
+                            step_label=f"carousel_slide_{snum}_video",
+                            max_polls=45,
+                            poll_interval=2.5,
+                        )
+                    else:
+                        child_id = _create_and_wait_container(
+                            {
+                                "image_url": sl_public_url,
+                                "is_carousel_item": "true",
+                                "access_token": ig_token,
+                            },
+                            step_label=f"carousel_slide_{snum}_image",
+                            max_polls=15,
+                            poll_interval=1.5,
+                        )
+                    children_ids.append(child_id)
+
+                creation_id = _create_and_wait_container(
+                    {
+                        "media_type": "CAROUSEL",
+                        "children": ",".join(children_ids),
+                        "caption": caption_text,
+                        "access_token": ig_token,
+                    },
+                    step_label="carousel_parent",
+                    max_polls=25,
+                    poll_interval=2.0,
+                )
+            elif public_video_url and staged_video_path:
                 # 2-Slide Carousel Post: Slide 1 = Marked-up Cover Image, Slide 2 = 10s Camera Video
                 child_img_id = _create_and_wait_container(
                     {
@@ -2673,6 +2973,8 @@ def publish_dispatch(
             staged_file_path.unlink(missing_ok=True)
             if staged_video_path:
                 staged_video_path.unlink(missing_ok=True)
+            for p_extra in extra_staged_paths:
+                p_extra.unlink(missing_ok=True)
     finally:
         lock_path.unlink(missing_ok=True)
 
@@ -3081,15 +3383,52 @@ def build_pressroom(
                         video_src_path = str(cand_v)
                         break
         video_uri = _copy_pressroom_media(video_src_path, press_media_dir, f"{eid}-video.mp4")
+        carousel_slides_cfg = prod.get("carousel_slides") or []
+        is_digest_carousel = len(carousel_slides_cfg) > 2 or prod.get("post_format") == "digest_carousel"
+        digest_slide_elements: List[str] = []
+        digest_slide_buttons: List[str] = []
+        if is_digest_carousel and len(carousel_slides_cfg) >= 2:
+            for sl in carousel_slides_cfg[1:]:
+                snum = int(sl.get("slide_number") or (len(digest_slide_elements) + 2))
+                skind = str(sl.get("kind") or "image")
+                slabel = _html_escape(sl.get("label") or f"Slide {snum}")
+                if skind == "video":
+                    s_uri = _copy_pressroom_media(sl.get("path"), press_media_dir, f"{eid}-slide{snum}.mp4")
+                    p_uri = _copy_pressroom_media(sl.get("poster_path"), press_media_dir, f"{eid}-slide{snum}-poster.jpg")
+                    if s_uri:
+                        digest_slide_buttons.append(
+                            f"<button class='tab-btn' onclick=\"switchView('{eid}', 'slide{snum}')\">{slabel}</button>"
+                        )
+                        digest_slide_elements.append(
+                            f'<video id="img-{eid}-slide{snum}" class="stage-img stage-video" controls playsinline preload="metadata" poster="{p_uri or raw_uri or cover_uri or ""}" src="{s_uri}"></video>'
+                        )
+                else:
+                    s_uri = _copy_pressroom_media(sl.get("path"), press_media_dir, f"{eid}-slide{snum}.jpg")
+                    if s_uri:
+                        digest_slide_buttons.append(
+                            f"<button class='tab-btn' onclick=\"switchView('{eid}', 'slide{snum}')\">{slabel}</button>"
+                        )
+                        digest_slide_elements.append(
+                            f'<img id="img-{eid}-slide{snum}" class="stage-img" src="{s_uri}" alt="{slabel}" />'
+                        )
+
         format_code = (
-            "carousel_video"
-            if (video_uri and cover_uri)
-            else ("video" if video_uri else "single_image")
+            "digest_carousel"
+            if is_digest_carousel
+            else (
+                "carousel_video"
+                if (video_uri and cover_uri)
+                else ("video" if video_uri else "single_image")
+            )
         )
         format_label = (
-            "2-Slide Carousel"
-            if format_code == "carousel_video"
-            else ("10s Video" if format_code == "video" else "Single Image")
+            f"{len(carousel_slides_cfg)}-Slide Digest"
+            if is_digest_carousel
+            else (
+                "2-Slide Carousel"
+                if format_code == "carousel_video"
+                else ("10s Video" if format_code == "video" else "Single Image")
+            )
         )
 
         sched_slot = slot_by_eid.get(rec.get("event_id"))
@@ -3230,18 +3569,28 @@ def build_pressroom(
             else ""
         )
         video_badge = (
-            "<span class='badge badge-video'>SLIDESHOW: COVER + 10S VIDEO</span>"
-            if (video_uri and cover_uri)
-            else ("<span class='badge badge-video'>VIDEO CLIP</span>" if video_uri else "")
+            f"<span class='badge badge-video'>DIGEST CAROUSEL ({len(carousel_slides_cfg)} SLIDES)</span>"
+            if is_digest_carousel
+            else (
+                "<span class='badge badge-video'>SLIDESHOW: COVER + 10S VIDEO</span>"
+                if (video_uri and cover_uri)
+                else ("<span class='badge badge-video'>VIDEO CLIP</span>" if video_uri else "")
+            )
         )
 
         view_buttons = []
         if cover_uri:
-            slide1_label = "Slide 1: 4:5 Cover (1080×1350)" if video_uri else "4:5 Cover (1080×1350)"
+            slide1_label = (
+                "Slide 1: 4:5 Cover (1080×1350)"
+                if (video_uri or is_digest_carousel)
+                else "4:5 Cover (1080×1350)"
+            )
             view_buttons.append(
                 f"<button class='tab-btn active' onclick=\"switchView('{eid}', 'cover')\">{slide1_label}</button>"
             )
-        if video_uri:
+        if is_digest_carousel and digest_slide_buttons:
+            view_buttons.extend(digest_slide_buttons)
+        elif video_uri:
             vid_active_cls = " active" if not cover_uri else ""
             vid_label = "▶ Slide 2: 10s Camera Video" if cover_uri else "▶ 10s Camera Video"
             view_buttons.append(
@@ -3308,7 +3657,7 @@ def build_pressroom(
                   <div class="view-tabs">{''.join(view_buttons)}</div>
                   <div class="frame-stage">
                     {f'<img id="img-{eid}-cover" class="stage-img visible" src="{cover_uri}" alt="Rendered Cover" />' if cover_uri else ''}
-                    {f'<video id="img-{eid}-video" class="stage-img stage-video {"visible" if not cover_uri else ""}" controls playsinline preload="metadata" poster="{raw_uri or cover_uri or ""}" src="{video_uri}"></video>' if video_uri else ''}
+                    {''.join(digest_slide_elements) if is_digest_carousel else (f'<video id="img-{eid}-video" class="stage-img stage-video {"visible" if not cover_uri else ""}" controls playsinline preload="metadata" poster="{raw_uri or cover_uri or ""}" src="{video_uri}"></video>' if video_uri else '')}
                     {f'<img id="img-{eid}-square" class="stage-img" src="{square_uri}" alt="1:1 Profile Crop" />' if square_uri else ''}
                     {f'<img id="img-{eid}-thumb" class="stage-img thumb-size" src="{thumb_uri}" alt="Small Thumbnail" />' if thumb_uri else ''}
                     {f'<div id="img-{eid}-raw" class="stage-img raw-crop-wrap {"visible" if (not cover_uri and not video_uri) else ""}"><img id="raw-photo-{eid}" class="raw-crop-img" src="{raw_uri}" alt="Raw Capture" onclick="handleRawImageClick(event, \'{eid}\')" title="Click anywhere on this raw frame to set the 4:5 crop focal point and re-render cover" /><div id="reticle-{eid}" class="crop-reticle" style="left:{focus_x_pct:.1f}%;top:{focus_y_pct:.1f}%;"></div></div>' if raw_uri else ''}
@@ -3521,6 +3870,7 @@ def build_pressroom(
           <label for="filter-format">Format</label>
           <select id="filter-format" onchange="applyFilters()">
             <option value="all">All Formats</option>
+            <option value="digest_carousel">Multi-Sighting Digest Carousel</option>
             <option value="carousel_video">2-Slide Carousel (Cover + 10s Video)</option>
             <option value="single_image">Single Image</option>
             <option value="video">Standalone Video</option>
@@ -4468,36 +4818,35 @@ def build_pressroom(
 
     function jumpToCardVideo(eid) {{
       jumpToCard(eid);
-      switchView(eid, 'video');
-      const vid = document.getElementById('img-' + eid + '-video');
+      const slide2 = document.getElementById('img-' + eid + '-slide2');
+      const targetMode = slide2 ? 'slide2' : 'video';
+      switchView(eid, targetMode);
+      const vid = document.getElementById('img-' + eid + '-' + targetMode);
       if (vid && typeof vid.play === 'function') {{
         vid.play().catch(() => {{}});
       }}
     }}
 
     function switchView(eid, mode) {{
-      const modes = ['cover', 'video', 'square', 'thumb', 'raw'];
-      modes.forEach(m => {{
-        const el = document.getElementById('img-' + eid + '-' + m);
-        if (el) {{
-          if (m === mode) {{
-            el.classList.add('visible');
-          }} else {{
-            el.classList.remove('visible');
-            if (el.tagName === 'VIDEO' && typeof el.pause === 'function') {{
-              el.pause();
-            }}
+      const card = document.getElementById('card-' + eid);
+      if (!card) return;
+      const prefix = 'img-' + eid + '-';
+      const stageEls = card.querySelectorAll('.frame-stage .stage-img');
+      stageEls.forEach(el => {{
+        if (el.id === prefix + mode) {{
+          el.classList.add('visible');
+        }} else {{
+          el.classList.remove('visible');
+          if (el.tagName === 'VIDEO' && typeof el.pause === 'function') {{
+            el.pause();
           }}
         }}
       }});
-      const card = document.getElementById('card-' + eid);
-      if (card) {{
-        const btns = card.querySelectorAll('.view-tabs .tab-btn');
-        btns.forEach(b => {{
-          if ((b.getAttribute('onclick') || '').includes("'" + mode + "'")) b.classList.add('active');
-          else b.classList.remove('active');
-        }});
-      }}
+      const btns = card.querySelectorAll('.view-tabs .tab-btn');
+      btns.forEach(b => {{
+        if ((b.getAttribute('onclick') || '').includes("'" + mode + "'")) b.classList.add('active');
+        else b.classList.remove('active');
+      }});
     }}
 
     function copyCaption(eid) {{

@@ -62,6 +62,9 @@ When acting as the user's **Reporter and Social Media Manager**, you run the edi
 4. **Slideshow / Video Posts (`attach_video_to_dispatch`)**:
    - When the trail camera records a Photo + 10s Video pair (or a standalone video), call `attach_video_to_dispatch(event_id, video_event_id=None)` (or CLI `python3 scripts/wildlife_desk.py attach-video <event_id>`).
    - This pairs the still cover (Slide 1: `1080×1350` marked-up front page) with the raw 10-second camera `.mp4` (Slide 2: `VIDEO` child container) for a 2-slide Instagram `CAROUSEL` post without any video editing.
+5. **Multi-Sighting Digest Carousels (`create_digest_dispatch`)**:
+   - When a single night or weekend contains 2–9 related secondary sightings (e.g., repeated passes by a coyote over a 10-minute window or multiple distinct sightings in a weekend roundup), call `create_digest_dispatch(primary_event_id, secondary_event_ids, headline, caption, section="Weekend Edition" | "Developing Story", camera_stamp=...)` (or CLI `python3 scripts/wildlife_desk.py create-digest <primary_event_id> <secondary_event_ids...> --headline ... --caption ...`).
+   - This bundles the anchor cover (`Slide 1: 1080×1350`) with sequential 10s video clips or 4:5 cropped still frames (`Slides 2..N`, up to 10 slides total) and archives the secondary events (`merged_into_event_id`) so they are not double-posted.
 
 ### Step 5: Inspect the Front Page & Open the Local Pressroom (`build_pressroom`)
 1. View the rendered cover (`output/<event_id>/cover-1080x1350.jpg`) and 1:1 grid crop (`output/<event_id>/crop-preview-1080x1080.jpg`) with your image viewer tool to verify that the headline is crisp and does not obscure the animal's face.
