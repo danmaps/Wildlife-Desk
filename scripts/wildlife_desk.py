@@ -2960,7 +2960,10 @@ def build_pressroom(
     )
 
     active_cards_html: List[str] = []
+    table_rows_html: List[str] = []
     wire_cards_html: List[str] = []
+    species_set: set[str] = set()
+    section_set: set[str] = set()
 
     for rec in dispatches:
         eid = _html_escape(rec.get("event_id"))
@@ -2970,11 +2973,18 @@ def build_pressroom(
         prod = rec.get("production") or {}
         elig = rec.get("eligibility") or {}
         src = rec.get("source") or {}
+        pub = rec.get("publication") or {}
 
         headline = _html_escape(ed.get("headline") or "UNHEADLINED SIGHTING")
         section = _html_escape(ed.get("section") or "Unassigned Beat")
         caption = _html_escape(ed.get("caption") or "No dispatch article drafted yet.")
         char_label = _html_escape(ed.get("character_label") or "")
+        species_raw = _primary_species(rec)
+        species_display = _html_escape(species_raw.title() if species_raw != "unknown" else "Unclassified / Empty")
+        if species_raw:
+            species_set.add(species_raw)
+        if ed.get("section"):
+            section_set.add(str(ed.get("section")).strip())
 
         cover_uri = _copy_pressroom_media(prod.get("cover_path"), press_media_dir, f"{eid}-cover.jpg")
         square_uri = _copy_pressroom_media(prod.get("square_preview_path"), press_media_dir, f"{eid}-square.jpg")
@@ -2986,6 +2996,8 @@ def build_pressroom(
             if raw_assets
             else None
         )
+        primary_filename = _html_escape(raw_assets[0].get("filename") if raw_assets else "")
+        capture_time_str = _html_escape(src.get("capture_time") or "")
 
         video_src_path = prod.get("video_path")
         if not video_src_path:
@@ -3000,6 +3012,99 @@ def build_pressroom(
                         video_src_path = str(cand_v)
                         break
         video_uri = _copy_pressroom_media(video_src_path, press_media_dir, f"{eid}-video.mp4")
+        format_code = (
+            "carousel_video"
+            if (video_uri and cover_uri)
+            else ("video" if video_uri else "single_image")
+        )
+        format_label = (
+            "2-Slide Carousel"
+            if format_code == "carousel_video"
+            else ("10s Video" if format_code == "video" else "Single Image")
+        )
+
+        sched_slot = slot_by_eid.get(rec.get("event_id"))
+        sched_iso = _html_escape(sched_slot["scheduled_iso"]) if (state == "ready" and sched_slot) else ""
+        sched_label = _html_escape(sched_slot["scheduled_label"]) if (state == "ready" and sched_slot) else ""
+        sched_pos = sched_slot["queue_position"] if (state == "ready" and sched_slot) else 999
+        published_at_str = _html_escape(pub.get("published_at") or "")
+        remote_post_id_str = _html_escape(pub.get("remote_post_id") or "")
+
+        hold_reasons_list = [str(h) for h in (elig.get("hold_reasons") or [])]
+        first_hold_reason = _html_escape(hold_reasons_list[0]) if hold_reasons_list else ""
+        caption_snippet = _html_escape((ed.get("caption") or "")[:140] + ("…" if len(ed.get("caption") or "") > 140 else ""))
+        summary_subtext = (
+            f"<span class='tbl-hold-note'>Hold: {first_hold_reason}</span>"
+            if state == "held" and first_hold_reason
+            else f"<span class='tbl-caption-snip'>{caption_snippet}</span>"
+        )
+
+        table_thumb_src = thumb_uri or cover_uri or raw_uri or ""
+        table_thumb_html = (
+            f'<img loading="lazy" class="tbl-thumb" src="{table_thumb_src}" alt="{headline}" '
+            f'onclick="jumpToCard(\'{eid}\')" />'
+            if table_thumb_src
+            else '<div class="tbl-thumb-empty">No Image</div>'
+        )
+        schedule_cell_html = (
+            f"<div class='tbl-sched'><strong>#{sched_pos}</strong> • {sched_label}</div>"
+            if (state == "ready" and sched_label)
+            else (
+                f"<div class='tbl-pub'>Published {published_at_str[:10]}<br/><span class='tbl-ig-id'>IG: {remote_post_id_str}</span></div>"
+                if state == "published"
+                else "<span class='tbl-muted'>—</span>"
+            )
+        )
+        sort_date_key = sched_iso or published_at_str or capture_time_str or "9999"
+        search_blob = _html_escape(
+            f"{eid} {state} {species_raw} {section} {headline} {char_label} {primary_filename} "
+            f"{ed.get('caption') or ''} {' '.join(hold_reasons_list)} {sched_label}".lower()
+        )
+
+        table_rows_html.append(
+            f"""
+            <tr class="dispatch-row state-{state}" id="row-{eid}"
+                data-eid="{eid}"
+                data-state="{state}"
+                data-species="{_html_escape(species_raw)}"
+                data-format="{format_code}"
+                data-section="{section}"
+                data-search="{search_blob}"
+                data-priority="{state_priority.get(rec.get('state', 'discovered'), 9)}"
+                data-queue="{sched_pos}"
+                data-date="{sort_date_key}"
+                data-capture="{capture_time_str}">
+              <td class="col-preview">
+                <div class="tbl-thumb-wrap">
+                  {table_thumb_html}
+                  {f'<span class="tbl-vid-pill" onclick="jumpToCardVideo(\'{eid}\')" title="Play 10s Video">▶ 10s</span>' if video_uri else ''}
+                </div>
+              </td>
+              <td class="col-status">
+                <span class="badge badge-{state}">{state.upper()}</span>
+                {schedule_cell_html}
+              </td>
+              <td class="col-species">
+                <span class="species-chip">{species_display}</span>
+              </td>
+              <td class="col-headline">
+                <div class="tbl-kicker">{section}{f' • {char_label}' if char_label else ''}</div>
+                <a href="#card-{eid}" class="tbl-headline-link" onclick="jumpToCard('{eid}'); return false;">{headline}</a>
+                <div class="tbl-subtext">{summary_subtext}</div>
+              </td>
+              <td class="col-meta">
+                <div><strong>{format_label}</strong></div>
+                <div class="tbl-muted">{primary_filename or eid}</div>
+                <div class="tbl-muted">{capture_time_str[:19].replace('T', ' ') if capture_time_str else '—'}</div>
+              </td>
+              <td class="col-actions">
+                <button class="tab-btn" onclick="jumpToCard('{eid}')">Inspect Card</button>
+                {f'<button class="tab-btn" onclick="jumpToCardVideo(\'{eid}\')">▶ Video</button>' if video_uri else ''}
+                {f'<button class="copy-btn" onclick="copyCaption(\'{eid}\')">Copy</button>' if ed.get('caption') else ''}
+              </td>
+            </tr>
+            """
+        )
 
         if state == "discovered":
             fname = _html_escape(raw_assets[0].get("filename") if raw_assets else eid)
@@ -3087,7 +3192,13 @@ def build_pressroom(
 
         active_cards_html.append(
             f"""
-            <article class="dispatch-card state-{state}" id="card-{eid}">
+            <article class="dispatch-card state-{state}" id="card-{eid}"
+                     data-eid="{eid}"
+                     data-state="{state}"
+                     data-species="{_html_escape(species_raw)}"
+                     data-format="{format_code}"
+                     data-section="{section}"
+                     data-search="{search_blob}">
               <header class="card-header">
                 <div>
                   <span class="kicker">{section}</span>
@@ -3165,11 +3276,125 @@ def build_pressroom(
         </details>
         """
 
-    body_cards = ("\n".join(active_cards_html) + "\n" + wire_drawer_html) if (active_cards_html or wire_cards_html) else (
-        "<div class='empty-state'>No sightings discovered yet. Run <code>discover_sightings</code> to check the wire.</div>"
+    species_options_html = "".join(
+        f'<option value="{_html_escape(sp)}">{_html_escape(sp.title() if sp != "unknown" else "Unclassified / Empty")}</option>'
+        for sp in sorted(species_set)
+    )
+    section_options_html = "".join(
+        f'<option value="{_html_escape(sec)}">{_html_escape(sec)}</option>'
+        for sec in sorted(section_set)
     )
 
     counts = listed["counts_by_state"]
+    total_dispatches = len(dispatches)
+    table_section_html = (
+        f"""
+        <section id="table-view-section" class="table-section">
+          <div class="table-scroll">
+            <table class="pressroom-table" id="dispatch-table">
+              <thead>
+                <tr>
+                  <th class="col-preview">Preview</th>
+                  <th class="col-status sortable" onclick="sortTableBy('status')">Status &amp; Schedule ⇅</th>
+                  <th class="col-species sortable" onclick="sortTableBy('species')">Species ⇅</th>
+                  <th class="col-headline sortable" onclick="sortTableBy('headline')">Headline &amp; Dispatch Summary ⇅</th>
+                  <th class="col-meta sortable" onclick="sortTableBy('capture')">Format &amp; Source ⇅</th>
+                  <th class="col-actions">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="dispatch-table-body">
+                {''.join(table_rows_html)}
+              </tbody>
+            </table>
+          </div>
+        </section>
+        """
+        if table_rows_html
+        else ""
+    )
+
+    cards_section_html = (
+        f'<section id="cards-view-section">{chr(10).join(active_cards_html)}{chr(10)}{wire_drawer_html}</section>'
+        if (active_cards_html or wire_cards_html)
+        else "<div class='empty-state'>No sightings discovered yet. Run <code>discover_sightings</code> to check the wire.</div>"
+    )
+
+    toolbar_html = f"""
+    <section class="pressroom-toolbar" aria-label="Pressroom Filters and View Switcher">
+      <div class="toolbar-top">
+        <div class="view-mode-group" role="group" aria-label="Layout Mode">
+          <button type="button" class="mode-btn active" id="mode-both" onclick="setLayoutMode('both')">⊞ Table + Cards</button>
+          <button type="button" class="mode-btn" id="mode-table" onclick="setLayoutMode('table')">☰ Table Only</button>
+          <button type="button" class="mode-btn" id="mode-cards" onclick="setLayoutMode('cards')">▤ Cards Only</button>
+        </div>
+
+        <div class="state-chip-group" role="group" aria-label="Quick State Filter">
+          <button type="button" class="state-chip active" data-state-btn="all" onclick="setQuickState('all')">All ({total_dispatches})</button>
+          <button type="button" class="state-chip chip-ready" data-state-btn="ready" onclick="setQuickState('ready')">Ready ({counts.get('ready', 0)})</button>
+          <button type="button" class="state-chip chip-published" data-state-btn="published" onclick="setQuickState('published')">Published ({counts.get('published', 0)})</button>
+          <button type="button" class="state-chip chip-held" data-state-btn="held" onclick="setQuickState('held')">Held ({counts.get('held', 0)})</button>
+          <button type="button" class="state-chip" data-state-btn="drafted" onclick="setQuickState('drafted')">Draft/Wire ({counts.get('drafted', 0) + counts.get('observed', 0) + counts.get('discovered', 0)})</button>
+        </div>
+
+        <div class="filter-count-box">
+          <span id="visible-count-label">Showing {total_dispatches} of {total_dispatches}</span>
+          <button type="button" class="reset-btn" onclick="resetFilters()">Reset</button>
+        </div>
+      </div>
+
+      <div class="toolbar-filters">
+        <div class="filter-field filter-search">
+          <label for="filter-q">Search</label>
+          <input type="search" id="filter-q" placeholder="Filter by headline, species, event ID, filename, caption, hold reason..." oninput="applyFilters()" />
+        </div>
+        <div class="filter-field">
+          <label for="filter-state">State</label>
+          <select id="filter-state" onchange="applyFilters(true)">
+            <option value="all">All States</option>
+            <option value="ready">Ready ({counts.get('ready', 0)})</option>
+            <option value="published">Published ({counts.get('published', 0)})</option>
+            <option value="held">Held ({counts.get('held', 0)})</option>
+            <option value="drafted">Drafted / Observed / Discovered</option>
+          </select>
+        </div>
+        <div class="filter-field">
+          <label for="filter-species">Species</label>
+          <select id="filter-species" onchange="applyFilters()">
+            <option value="all">All Species</option>
+            {species_options_html}
+          </select>
+        </div>
+        <div class="filter-field">
+          <label for="filter-format">Format</label>
+          <select id="filter-format" onchange="applyFilters()">
+            <option value="all">All Formats</option>
+            <option value="carousel_video">2-Slide Carousel (Cover + 10s Video)</option>
+            <option value="single_image">Single Image</option>
+            <option value="video">Standalone Video</option>
+          </select>
+        </div>
+        <div class="filter-field">
+          <label for="filter-section">Section Beat</label>
+          <select id="filter-section" onchange="applyFilters()">
+            <option value="all">All Sections</option>
+            {section_options_html}
+          </select>
+        </div>
+        <div class="filter-field">
+          <label for="sort-select">Sort Table</label>
+          <select id="sort-select" onchange="sortTableFromSelect()">
+            <option value="default">Queue &amp; Editorial Order</option>
+            <option value="status">Scheduled / Published Date</option>
+            <option value="capture-desc">Capture Time (Newest)</option>
+            <option value="capture-asc">Capture Time (Oldest)</option>
+            <option value="species">Species (A–Z)</option>
+            <option value="headline">Headline (A–Z)</option>
+          </select>
+        </div>
+      </div>
+    </section>
+    """
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3236,7 +3461,249 @@ def build_pressroom(
     main {{
       max-width: 1360px;
       margin: 0 auto;
-      padding: 28px 24px 64px;
+      padding: 24px 24px 64px;
+    }}
+    /* Filter & View Toolbar */
+    .pressroom-toolbar {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px 20px;
+      margin-bottom: 24px;
+      position: sticky;
+      top: 0;
+      z-index: 40;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    }}
+    .toolbar-top {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      padding-bottom: 14px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 14px;
+    }}
+    .view-mode-group, .state-chip-group {{
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }}
+    .mode-btn, .state-chip, .reset-btn {{
+      background: #1f262e;
+      color: var(--text);
+      border: 1px solid var(--border);
+      padding: 6px 12px;
+      border-radius: 5px;
+      cursor: pointer;
+      font-size: 0.8rem;
+      font-weight: 600;
+      transition: all 0.12s ease;
+    }}
+    .mode-btn:hover, .state-chip:hover, .reset-btn:hover {{
+      border-color: var(--muted);
+    }}
+    .mode-btn.active, .state-chip.active {{
+      background: var(--text);
+      color: #090b0d;
+      border-color: var(--text);
+    }}
+    .state-chip.chip-ready.active {{ background: var(--ready); color: #fff; border-color: #34d399; }}
+    .state-chip.chip-published.active {{ background: var(--published); color: #fff; border-color: #34d399; }}
+    .state-chip.chip-held.active {{ background: var(--held); color: #fff; border-color: #fb923c; }}
+    .filter-count-box {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.82rem;
+      color: var(--muted);
+    }}
+    .toolbar-filters {{
+      display: grid;
+      grid-template-columns: 2fr repeat(5, minmax(130px, 1fr));
+      gap: 10px;
+      align-items: end;
+    }}
+    @media (max-width: 1100px) {{
+      .toolbar-filters {{
+        grid-template-columns: 1fr 1fr;
+      }}
+      .filter-search {{ grid-column: 1 / -1; }}
+      .pressroom-toolbar {{ position: static; }}
+    }}
+    .filter-field {{
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }}
+    .filter-field label {{
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      font-weight: 700;
+    }}
+    .filter-field input, .filter-field select {{
+      background: #0b0e11;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 8px 10px;
+      font-size: 0.85rem;
+      width: 100%;
+    }}
+    .filter-field input:focus, .filter-field select:focus {{
+      outline: none;
+      border-color: #60a5fa;
+    }}
+    /* Table View */
+    .table-section {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 32px;
+      overflow: hidden;
+    }}
+    .table-scroll {{
+      overflow-x: auto;
+    }}
+    .pressroom-table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.88rem;
+      text-align: left;
+    }}
+    .pressroom-table th {{
+      background: #101418;
+      color: var(--muted);
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+      user-select: none;
+    }}
+    .pressroom-table th.sortable {{
+      cursor: pointer;
+    }}
+    .pressroom-table th.sortable:hover {{
+      color: var(--text);
+      background: #181e24;
+    }}
+    .pressroom-table td {{
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }}
+    .pressroom-table tr.dispatch-row:hover {{
+      background: rgba(255, 255, 255, 0.03);
+    }}
+    .tbl-thumb-wrap {{
+      position: relative;
+      width: 68px;
+      height: 85px;
+      border-radius: 5px;
+      overflow: hidden;
+      background: #07090b;
+      border: 1px solid var(--border);
+      flex-shrink: 0;
+    }}
+    .tbl-thumb {{
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+      cursor: pointer;
+    }}
+    .tbl-thumb-empty {{
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.68rem;
+      color: var(--muted);
+    }}
+    .tbl-vid-pill {{
+      position: absolute;
+      bottom: 4px;
+      right: 4px;
+      background: rgba(2, 132, 199, 0.92);
+      color: #fff;
+      font-size: 0.65rem;
+      font-weight: 700;
+      padding: 2px 5px;
+      border-radius: 3px;
+      cursor: pointer;
+      letter-spacing: 0.03em;
+    }}
+    .tbl-sched {{
+      margin-top: 6px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.76rem;
+      color: #fbbf24;
+    }}
+    .tbl-pub {{
+      margin-top: 6px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.74rem;
+      color: #34d399;
+    }}
+    .tbl-ig-id {{
+      color: var(--muted);
+      font-size: 0.7rem;
+    }}
+    .species-chip {{
+      display: inline-block;
+      padding: 4px 9px;
+      border-radius: 999px;
+      background: #222932;
+      border: 1px solid var(--border);
+      font-size: 0.78rem;
+      font-weight: 600;
+      white-space: nowrap;
+    }}
+    .tbl-kicker {{
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      font-weight: 700;
+    }}
+    .tbl-headline-link {{
+      color: var(--text);
+      font-weight: 700;
+      font-size: 0.98rem;
+      text-decoration: none;
+      display: inline-block;
+      margin: 2px 0;
+    }}
+    .tbl-headline-link:hover {{
+      text-decoration: underline;
+      color: #93c5fd;
+    }}
+    .tbl-subtext {{
+      font-size: 0.8rem;
+      color: var(--muted);
+      max-width: 540px;
+    }}
+    .tbl-hold-note {{
+      color: #fdba74;
+    }}
+    .tbl-muted {{
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.76rem;
+    }}
+    .col-actions {{
+      white-space: nowrap;
+    }}
+    .col-actions button {{
+      margin-right: 4px;
+      margin-bottom: 4px;
     }}
     .dispatch-card {{
       background: var(--panel);
@@ -3244,6 +3711,11 @@ def build_pressroom(
       border-radius: 8px;
       margin-bottom: 32px;
       overflow: hidden;
+      transition: border-color 0.25s ease, box-shadow 0.25s ease;
+    }}
+    .dispatch-card.card-highlight {{
+      border-color: #38bdf8;
+      box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.35);
     }}
     .card-header {{
       padding: 20px 24px;
@@ -3453,6 +3925,9 @@ def build_pressroom(
       justify-content: space-between;
       color: var(--muted);
     }}
+    .hidden-by-filter, .hidden-by-mode {{
+      display: none !important;
+    }}
   </style>
 </head>
 <body>
@@ -3470,9 +3945,182 @@ def build_pressroom(
     </div>
   </header>
   <main>
-    {body_cards}
+    {toolbar_html}
+    {table_section_html}
+    {cards_section_html}
   </main>
   <script>
+    let currentLayoutMode = 'both';
+    let currentSortAsc = true;
+    let lastSortCol = 'default';
+
+    function setLayoutMode(mode) {{
+      currentLayoutMode = mode;
+      ['both', 'table', 'cards'].forEach(m => {{
+        const btn = document.getElementById('mode-' + m);
+        if (btn) btn.classList.toggle('active', m === mode);
+      }});
+      const tblSec = document.getElementById('table-view-section');
+      const crdSec = document.getElementById('cards-view-section');
+      if (tblSec) tblSec.classList.toggle('hidden-by-mode', mode === 'cards');
+      if (crdSec) crdSec.classList.toggle('hidden-by-mode', mode === 'table');
+    }}
+
+    function setQuickState(st) {{
+      const sel = document.getElementById('filter-state');
+      if (sel) sel.value = st;
+      applyFilters(true);
+    }}
+
+    function applyFilters(syncChips) {{
+      const q = (document.getElementById('filter-q')?.value || '').trim().toLowerCase();
+      const st = document.getElementById('filter-state')?.value || 'all';
+      const sp = document.getElementById('filter-species')?.value || 'all';
+      const fmt = document.getElementById('filter-format')?.value || 'all';
+      const sec = document.getElementById('filter-section')?.value || 'all';
+
+      if (syncChips) {{
+        document.querySelectorAll('.state-chip').forEach(btn => {{
+          btn.classList.toggle('active', btn.getAttribute('data-state-btn') === st);
+        }});
+      }}
+
+      function matchesItem(el) {{
+        const elState = el.getAttribute('data-state') || '';
+        const elSpecies = el.getAttribute('data-species') || '';
+        const elFormat = el.getAttribute('data-format') || '';
+        const elSection = el.getAttribute('data-section') || '';
+        const elSearch = el.getAttribute('data-search') || '';
+
+        if (st !== 'all') {{
+          if (st === 'drafted') {{
+            if (!['drafted', 'observed', 'discovered'].includes(elState)) return false;
+          }} else if (elState !== st) {{
+            return false;
+          }}
+        }}
+        if (sp !== 'all' && elSpecies !== sp) return false;
+        if (fmt !== 'all' && elFormat !== fmt) return false;
+        if (sec !== 'all' && elSection !== sec) return false;
+        if (q && !elSearch.includes(q)) return false;
+        return true;
+      }}
+
+      const rows = document.querySelectorAll('.dispatch-row');
+      let visibleCount = 0;
+      rows.forEach(r => {{
+        const ok = matchesItem(r);
+        r.classList.toggle('hidden-by-filter', !ok);
+        if (ok) visibleCount++;
+      }});
+
+      const cards = document.querySelectorAll('.dispatch-card');
+      cards.forEach(c => {{
+        const ok = matchesItem(c);
+        c.classList.toggle('hidden-by-filter', !ok);
+      }});
+
+      const countLbl = document.getElementById('visible-count-label');
+      if (countLbl) {{
+        countLbl.textContent = 'Showing ' + visibleCount + ' of ' + rows.length;
+      }}
+    }}
+
+    function resetFilters() {{
+      const q = document.getElementById('filter-q');
+      const st = document.getElementById('filter-state');
+      const sp = document.getElementById('filter-species');
+      const fmt = document.getElementById('filter-format');
+      const sec = document.getElementById('filter-section');
+      const srt = document.getElementById('sort-select');
+      if (q) q.value = '';
+      if (st) st.value = 'all';
+      if (sp) sp.value = 'all';
+      if (fmt) fmt.value = 'all';
+      if (sec) sec.value = 'all';
+      if (srt) {{
+        srt.value = 'default';
+        sortTableFromSelect();
+      }}
+      applyFilters(true);
+    }}
+
+    function sortTableBy(col) {{
+      if (lastSortCol === col) {{
+        currentSortAsc = !currentSortAsc;
+      }} else {{
+        lastSortCol = col;
+        currentSortAsc = true;
+      }}
+      const tbody = document.getElementById('dispatch-table-body');
+      if (!tbody) return;
+      const rows = Array.from(tbody.querySelectorAll('.dispatch-row'));
+      rows.sort((a, b) => {{
+        let cmp = 0;
+        if (col === 'default') {{
+          const pa = parseInt(a.getAttribute('data-priority') || '9', 10);
+          const pb = parseInt(b.getAttribute('data-priority') || '9', 10);
+          if (pa !== pb) cmp = pa - pb;
+          else {{
+            const qa = parseInt(a.getAttribute('data-queue') || '999', 10);
+            const qb = parseInt(b.getAttribute('data-queue') || '999', 10);
+            cmp = qa !== qb ? qa - qb : (a.getAttribute('data-eid') || '').localeCompare(b.getAttribute('data-eid') || '');
+          }}
+        }} else if (col === 'status') {{
+          const pa = parseInt(a.getAttribute('data-priority') || '9', 10);
+          const pb = parseInt(b.getAttribute('data-priority') || '9', 10);
+          if (pa !== pb) cmp = pa - pb;
+          else cmp = (a.getAttribute('data-date') || '').localeCompare(b.getAttribute('data-date') || '');
+        }} else if (col === 'species') {{
+          cmp = (a.getAttribute('data-species') || '').localeCompare(b.getAttribute('data-species') || '');
+        }} else if (col === 'headline') {{
+          const ha = a.querySelector('.tbl-headline-link')?.textContent || '';
+          const hb = b.querySelector('.tbl-headline-link')?.textContent || '';
+          cmp = ha.localeCompare(hb);
+        }} else if (col === 'capture') {{
+          cmp = (a.getAttribute('data-capture') || '').localeCompare(b.getAttribute('data-capture') || '');
+        }}
+        return currentSortAsc ? cmp : -cmp;
+      }});
+      rows.forEach(r => tbody.appendChild(r));
+    }}
+
+    function sortTableFromSelect() {{
+      const val = document.getElementById('sort-select')?.value || 'default';
+      lastSortCol = '';
+      if (val === 'capture-desc') {{
+        lastSortCol = 'capture';
+        currentSortAsc = true; // sortTableBy will flip to false (descending)
+        sortTableBy('capture');
+      }} else if (val === 'capture-asc') {{
+        sortTableBy('capture');
+      }} else {{
+        sortTableBy(val);
+      }}
+    }}
+
+    function jumpToCard(eid) {{
+      if (currentLayoutMode === 'table') {{
+        setLayoutMode('both');
+      }}
+      const card = document.getElementById('card-' + eid);
+      if (card) {{
+        card.classList.remove('hidden-by-filter');
+        card.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+        card.classList.add('card-highlight');
+        setTimeout(() => card.classList.remove('card-highlight'), 2200);
+      }}
+    }}
+
+    function jumpToCardVideo(eid) {{
+      jumpToCard(eid);
+      switchView(eid, 'video');
+      const vid = document.getElementById('img-' + eid + '-video');
+      if (vid && typeof vid.play === 'function') {{
+        vid.play().catch(() => {{}});
+      }}
+    }}
+
     function switchView(eid, mode) {{
       const modes = ['cover', 'video', 'square', 'thumb', 'raw'];
       modes.forEach(m => {{
