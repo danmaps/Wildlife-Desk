@@ -55,9 +55,10 @@ When acting as the user's **Reporter and Social Media Manager**, you run the edi
    - `Local Affairs` — Routine crossings, grazing, and camera inspections.
    - `Developing Story` — A later capture adds a supported detail to an earlier report.
    - `Weekend Edition` — A small selection of distinct sightings with source-backed summaries.
-3. Call `draft_dispatch(event_id, headline, caption, section, layout_position="auto")`:
+3. Call `draft_dispatch(event_id, headline, caption, section, layout_position="auto", camera_stamp=...)`:
    - **Headline**: 5–12 words, uppercase, deadpan municipal newspaper tone (e.g., `RACCOON PAUSES FOR UNSCHEDULED OVERNIGHT CAMERA INSPECTION`).
    - **Caption**: 60–120 words across 2–3 short paragraphs: state what happened, add supported details or uncertainties, and close with one dry observation. No emojis or hashtags.
+   - **Camera Stamp (Mandatory)**: Always transcribe the date, time, and temperature stamp from the bottom HUD bar of the raw trail-camera capture (e.g. `camera_stamp="10/01/2026 01:53:47 • 16°C / 61°F"`). Because the 4:5 cover crop trims the bottom HUD bar for visual cleanliness, `draft_dispatch` automatically appends `Camera Stamp: <camera_stamp>` to the end of the caption so every post preserves the exact camera timestamp.
 4. **Slideshow / Video Posts (`attach_video_to_dispatch`)**:
    - When the trail camera records a Photo + 10s Video pair (or a standalone video), call `attach_video_to_dispatch(event_id, video_event_id=None)` (or CLI `python3 scripts/wildlife_desk.py attach-video <event_id>`).
    - This pairs the still cover (Slide 1: `1080×1350` marked-up front page) with the raw 10-second camera `.mp4` (Slide 2: `VIDEO` child container) for a 2-slide Instagram `CAROUSEL` post without any video editing.

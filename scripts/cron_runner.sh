@@ -45,7 +45,7 @@ echo "[$(date -Iseconds)] Discovered (uncurated) sightings count: ${DISCOVERED_C
 # 2. Trigger Headless AI Curation ONLY when new uncurated captures exist
 if [[ "${DISCOVERED_COUNT}" -gt 0 ]]; then
     echo "[$(date -Iseconds)] New captures detected (${DISCOVERED_COUNT}). Launching headless editorial curation..."
-    AGENT_PROMPT="You are operating The Wildlife Desk in ${REPO_DIR}. Follow SKILL.md and docs/EDITORIAL.md strictly. Run list_dispatches(state_filter='discovered'). For each discovered sighting, visually inspect its cached preview image (and companion video preview if paired), screen for privacy/empty frames/redundant same-visit captures (call hold_dispatch when appropriate), and for distinct wildlife sightings record asset-linked observations and draft READY 2-slide Carousel dispatches (draft_dispatch with auto_render_cover=True). Finally run build_pressroom."
+    AGENT_PROMPT="You are operating The Wildlife Desk in ${REPO_DIR}. Follow SKILL.md and docs/EDITORIAL.md strictly. Run list_dispatches(state_filter='discovered'). For each discovered sighting, visually inspect its cached preview image (and companion video preview if paired), read the exact date/time/temp stamp from the bottom HUD bar of the raw capture, screen for privacy/empty frames/redundant same-visit captures (call hold_dispatch when appropriate), and for distinct wildlife sightings record asset-linked observations and draft READY 2-slide Carousel dispatches (draft_dispatch with camera_stamp='<MM/DD/YYYY HH:MM:SS • temp>' and auto_render_cover=True). Finally run build_pressroom."
 
     if command -v codex >/dev/null 2>&1; then
         codex exec --full-auto -C "${REPO_DIR}" "${AGENT_PROMPT}" || echo "[$(date -Iseconds)] WARNING: headless codex run exited non-zero"

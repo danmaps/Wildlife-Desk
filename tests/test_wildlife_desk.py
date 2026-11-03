@@ -444,16 +444,20 @@ def test_attach_video_and_pressroom_video_playback(tmp_path: Path):
         headline="OPOSSUM CONDUCTS LOW-SPEED INSPECTION OF PERIMETER",
         caption="An opossum crossed the clearing in infrared mode and continued through the ten-second clip.",
         section="The Night Shift",
+        camera_stamp="11/01/2026 03:10:00 • 14°C / 57°F",
         env_override=env,
     )
     assert drafted["production"]["post_format"] == "carousel_video"
     assert drafted["production"]["video_path"].endswith(".mp4")
+    assert drafted["editorial"]["camera_stamp"] == "11/01/2026 03:10:00 • 14°C / 57°F"
+    assert "Camera Stamp: 11/01/2026 03:10:00 • 14°C / 57°F" in drafted["editorial"]["caption"]
 
     press = wildlife_desk.build_pressroom(start_server=False, env_override=env)
     html_text = Path(press["pressroom_html_path"]).read_text(encoding="utf-8")
     assert "SLIDESHOW: COVER + 10S VIDEO" in html_text
     assert f"media/{img_eid}-video.mp4" in html_text
     assert "<video" in html_text
+    assert "11/01/2026 03:10:00 • 14°C / 57°F" in html_text
 
 
 def test_schedule_interleaving_and_drip_publish(tmp_path: Path):

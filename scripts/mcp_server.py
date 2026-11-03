@@ -183,12 +183,15 @@ def draft_dispatch(
     layout_position: str = "auto",
     crop_focus_x: Optional[float] = None,
     crop_focus_y: Optional[float] = None,
+    camera_stamp: Optional[str] = None,
     auto_render_cover: bool = True,
 ) -> str:
     """
     Save the deadpan newspaper headline (5-12 words) and short Instagram caption article
     (60-120 words, 2-3 paragraphs), validate factual support and privacy eligibility,
     and render the 1080x1350 front-page cover.
+    Always pass `camera_stamp` transcribed from the bottom HUD bar of the raw capture
+    (e.g. `'10/01/2026 01:53:47 • 16°C / 61°F'`) so the date/time stamp is appended to the caption.
     `section` must be one of: `'The Night Shift'`, `'Local Affairs'`, `'Developing Story'`, `'Weekend Edition'`.
     `layout_position` can be `'auto'`, `'bottom-left'`, `'bottom-right'`, `'top-left'`, or `'top-right'`.
     """
@@ -203,6 +206,7 @@ def draft_dispatch(
         layout_position=layout_position,
         crop_focus_x=crop_focus_x,
         crop_focus_y=crop_focus_y,
+        camera_stamp=camera_stamp,
         auto_render_cover=auto_render_cover,
     )
 

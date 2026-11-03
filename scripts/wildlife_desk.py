@@ -1481,6 +1481,7 @@ def draft_dispatch(
     caption: str,
     section: str = "Local Affairs",
     character_label: Optional[str] = None,
+    camera_stamp: Optional[str] = None,
     selected_asset_id: Optional[str] = None,
     layout_position: str = "auto",
     crop_focus_x: Optional[float] = None,
@@ -1492,6 +1493,8 @@ def draft_dispatch(
     """
     Save an editorial headline and caption article for a sighting, validate factual
     and privacy rules, and optionally render the 1080x1350 front-page cover.
+    If `camera_stamp` (the date/time/temp stamp from the bottom HUD of the capture) is provided,
+    it is stored on the record and automatically appended to the caption if not already present.
     """
     config = load_config(env_override=env_override, repo_dir=repo_dir)
     dirs = ensure_runtime_dirs(config)
@@ -1511,13 +1514,26 @@ def draft_dispatch(
             f"selected_asset_id '{chosen_asset}' is not in event {event_id} assets: {valid_assets}"
         )
 
+    resolved_stamp = (
+        camera_stamp.strip()
+        if camera_stamp and camera_stamp.strip()
+        else (record.get("editorial") or {}).get("camera_stamp")
+        or (record.get("source") or {}).get("camera_stamp")
+    )
+    clean_caption = caption.strip()
+    if resolved_stamp:
+        record.setdefault("source", {})["camera_stamp"] = resolved_stamp
+        if resolved_stamp not in clean_caption and "camera stamp:" not in clean_caption.lower() and "camera log:" not in clean_caption.lower():
+            clean_caption = f"{clean_caption}\n\nCamera Stamp: {resolved_stamp}"
+
     record["editorial"] = {
         "section": clean_section,
         "headline": headline.strip().upper(),
-        "caption": caption.strip(),
+        "caption": clean_caption,
         "character_label": character_label.strip() if character_label else None,
+        "camera_stamp": resolved_stamp,
         "selected_asset_id": chosen_asset,
-        "word_count": len(caption.strip().split()),
+        "word_count": len(clean_caption.split()),
         "headline_word_count": len(headline.strip().split()),
     }
 
@@ -1530,7 +1546,7 @@ def draft_dispatch(
 
     _recompute_eligibility(record, env_override=env_override, repo_dir=repo_dir)
     if record["eligibility"]["privacy_check"] == "passed" and record["eligibility"]["factual_support_check"] == "passed":
-        record["state"] = "drafted"
+        record["state"] = "ready" if record["eligibility"].get("publishable") else "drafted"
     else:
         record["state"] = "held"
 
@@ -2998,6 +3014,7 @@ def build_pressroom(
         )
         primary_filename = _html_escape(raw_assets[0].get("filename") if raw_assets else "")
         capture_time_str = _html_escape(src.get("capture_time") or "")
+        camera_stamp_str = _html_escape(ed.get("camera_stamp") or src.get("camera_stamp") or "")
 
         video_src_path = prod.get("video_path")
         if not video_src_path:
@@ -3058,7 +3075,7 @@ def build_pressroom(
         sort_date_key = sched_iso or published_at_str or capture_time_str or "9999"
         search_blob = _html_escape(
             f"{eid} {state} {species_raw} {section} {headline} {char_label} {primary_filename} "
-            f"{ed.get('caption') or ''} {' '.join(hold_reasons_list)} {sched_label}".lower()
+            f"{camera_stamp_str} {ed.get('caption') or ''} {' '.join(hold_reasons_list)} {sched_label}".lower()
         )
 
         table_rows_html.append(
@@ -3073,7 +3090,7 @@ def build_pressroom(
                 data-priority="{state_priority.get(rec.get('state', 'discovered'), 9)}"
                 data-queue="{sched_pos}"
                 data-date="{sort_date_key}"
-                data-capture="{capture_time_str}">
+                data-capture="{camera_stamp_str or capture_time_str}">
               <td class="col-preview">
                 <div class="tbl-thumb-wrap">
                   {table_thumb_html}
@@ -3095,7 +3112,7 @@ def build_pressroom(
               <td class="col-meta">
                 <div><strong>{format_label}</strong></div>
                 <div class="tbl-muted">{primary_filename or eid}</div>
-                <div class="tbl-muted">{capture_time_str[:19].replace('T', ' ') if capture_time_str else '—'}</div>
+                <div class="tbl-muted">{camera_stamp_str or (capture_time_str[:19].replace('T', ' ') if capture_time_str else '—')}</div>
               </td>
               <td class="col-actions">
                 <button class="tab-btn" onclick="jumpToCard('{eid}')">Inspect Card</button>
@@ -3227,6 +3244,7 @@ def build_pressroom(
                   <div class="meta-strip">
                     <span>Assets: {len(raw_assets)}</span>
                     <span>Format: {'2-Slide Carousel (Cover + Video)' if (video_uri and cover_uri) else ('Video' if video_uri else 'Single Image')}</span>
+                    {f'<span>Camera Stamp: <strong>{camera_stamp_str}</strong></span>' if camera_stamp_str else ''}
                     <span>File Import/EXIF: {_html_escape(src.get('capture_time') or 'Unknown')}</span>
                     <span>TZ Verified: {'Yes' if src.get('capture_timezone_known') else 'No (Naive Camera Clock)'}</span>
                     <span>Layout: {_html_escape(prod.get('layout_position') or 'n/a')} ({_html_escape(prod.get('font_size_px') or '-')}px)</span>
