@@ -629,6 +629,18 @@ def test_interactive_pressroom_api_actions(tmp_path: Path):
     assert f"saveDispatchDraft('{eid}')" in html_text
     assert f"reticle-{eid}" in html_text
 
+    # If `node` is installed, verify the Pressroom inline <script> parses cleanly without syntax errors
+    import re
+    import shutil
+    import subprocess
+    if shutil.which("node"):
+        m_js = re.search(r"<script>(.*?)</script>", html_text, re.S)
+        assert m_js is not None
+        js_file = tmp_path / "pressroom_inline.js"
+        js_file.write_text(m_js.group(1), encoding="utf-8")
+        proc = subprocess.run(["node", "--check", str(js_file)], capture_output=True, text=True)
+        assert proc.returncode == 0, f"Pressroom JS syntax error: {proc.stderr}"
+
 
 def test_create_digest_dispatch_and_multi_slide_publish(tmp_path: Path):
     """

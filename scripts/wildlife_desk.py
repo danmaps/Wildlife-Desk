@@ -5125,7 +5125,7 @@ def build_pressroom(
         setEditStatus(eid, '✓ Restored to ' + res.record.state.toUpperCase(), false);
       }} catch (err) {{
         setEditStatus(eid, '✗ Cannot unhold: ' + err.message, true);
-        window.alert('Cannot unhold ' + eid + ':\n' + err.message);
+        window.alert('Cannot unhold ' + eid + ':\\n' + err.message);
       }}
     }}
   </script>
