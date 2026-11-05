@@ -262,12 +262,15 @@ def create_digest_dispatch(
     layout_position: str = "auto",
     crop_focus_x: Optional[float] = None,
     crop_focus_y: Optional[float] = None,
+    slide_crop_focus: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Bundle 2-9 related sighting events into a single multi-slide Digest Carousel
     dispatch (`'Weekend Edition'` or `'Developing Story'`, up to 10 total Instagram slides:
     Slide 1 = 1080x1350 Front-Page Cover, Slides 2..N = sequential 10s camera videos or
     4:5 still frames from each constituent event).
+    Optional `slide_crop_focus` maps slide numbers (`"1"`, `"2"`, ...) or `event_id`s to
+    `[focus_x, focus_y]` so each slide has its own independent 4:5 crop focal point.
     Marks secondary constituent events with `source.merged_into_event_id` so they are
     archived and never double-posted.
     """
@@ -283,6 +286,30 @@ def create_digest_dispatch(
         layout_position=layout_position,
         crop_focus_x=crop_focus_x,
         crop_focus_y=crop_focus_y,
+        slide_crop_focus=slide_crop_focus,
+    )
+
+
+@mcp.tool()
+def recrop_carousel_slide(
+    event_id: str,
+    slide_number: int = 1,
+    crop_focus_x: Optional[float] = None,
+    crop_focus_y: Optional[float] = None,
+    layout_position: Optional[str] = None,
+) -> str:
+    """
+    Update the 4:5 crop focal point `(crop_focus_x, crop_focus_y)` for a specific slide
+    (`slide_number = 1..N`) on a dispatch and re-render that slide's 1080x1350 image/poster
+    without disturbing the focal points of other slides in the carousel.
+    """
+    return _safe_json_response(
+        wildlife_desk.recrop_carousel_slide,
+        event_id=event_id,
+        slide_number=slide_number,
+        crop_focus_x=crop_focus_x,
+        crop_focus_y=crop_focus_y,
+        layout_position=layout_position,
     )
 
 

@@ -694,25 +694,51 @@ def test_create_digest_dispatch_and_multi_slide_publish(tmp_path: Path):
             eids[1]: "11/02/2026 02:14:00 • 14°C / 57°F",
             eids[2]: "11/02/2026 02:19:00 • 14°C / 57°F",
         },
+        slide_crop_focus={
+            "1": [0.42, 0.50],
+            eids[0]: [0.22, 0.40],
+            eids[2]: [0.80, 0.55],
+        },
         env_override=env,
     )
     assert digest["state"] == "ready"
     assert digest["production"]["post_format"] == "digest_carousel"
-    assert len(digest["production"]["carousel_slides"]) == 4  # 1 Cover + 3 Constituent Slides
+    slides = digest["production"]["carousel_slides"]
+    assert len(slides) == 4  # 1 Cover + 3 Constituent Slides
     assert "Camera Stamps:" in digest["editorial"]["caption"]
+    assert slides[0]["crop_focus_x"] == pytest.approx(0.42)
+    assert slides[1]["crop_focus_x"] == pytest.approx(0.22)
+    assert slides[3]["crop_focus_x"] == pytest.approx(0.80)
+
+    # Re-crop Slide 3 independently via Pressroom API (/recrop with slide_number=3)
+    recrop_s3 = wildlife_desk.handle_pressroom_api_action(
+        f"/api/dispatch/{eids[1]}/recrop",
+        {"slide_number": 3, "crop_focus_x": 0.66, "crop_focus_y": 0.48},
+        env_override=env,
+    )
+    assert recrop_s3["ok"] is True
+    updated_slides = recrop_s3["record"]["production"]["carousel_slides"]
+    assert updated_slides[0]["crop_focus_x"] == pytest.approx(0.42)  # Slide 1 untouched
+    assert updated_slides[1]["crop_focus_x"] == pytest.approx(0.22)  # Slide 2 untouched
+    assert updated_slides[2]["crop_focus_x"] == pytest.approx(0.66)  # Slide 3 updated
+    assert updated_slides[2]["crop_focus_y"] == pytest.approx(0.48)
+    assert updated_slides[3]["crop_focus_x"] == pytest.approx(0.80)  # Slide 4 untouched
 
     # Secondary events should be hidden from the main queue
     listed = wildlife_desk.list_dispatches(env_override=env)
     assert listed["total_count"] == 1
     assert listed["dispatches"][0]["event_id"] == eids[1]
 
-    # Pressroom should render multi-slide tabs for Slide 2, Slide 3, Slide 4
+    # Pressroom should render multi-slide tabs and per-slide Crop Target pills
     press = wildlife_desk.build_pressroom(start_server=False, env_override=env)
     html_text = Path(press["pressroom_html_path"]).read_text(encoding="utf-8")
     assert "DIGEST CAROUSEL (4 SLIDES)" in html_text
     assert f"switchView('{eids[1]}', 'slide2')" in html_text
     assert f"switchView('{eids[1]}', 'slide3')" in html_text
     assert f"switchView('{eids[1]}', 'slide4')" in html_text
+    assert f"selectCropSlide('{eids[1]}', 2, true)" in html_text
+    assert f"selectCropSlide('{eids[1]}', 3, true)" in html_text
+    assert f"selectCropSlide('{eids[1]}', 4, true)" in html_text
 
     # Publishing should record a 4-slide CAROUSEL receipt
     pub = wildlife_desk.publish_dispatch(eids[1], env_override=env)

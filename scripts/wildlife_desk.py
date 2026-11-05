@@ -1956,6 +1956,11 @@ def render_dispatch_cover(
 
     if isinstance(prev_slides, list) and len(prev_slides) >= 2:
         prev_slides[0]["path"] = str(cover_path)
+        prev_slides[0]["cropped_image_path"] = str(cover_path)
+        prev_slides[0]["crop_focus_x"] = fx
+        prev_slides[0]["crop_focus_y"] = fy
+        if not prev_slides[0].get("raw_path") and source_path:
+            prev_slides[0]["raw_path"] = str(source_path)
         resolved_format = "digest_carousel" if len(prev_slides) > 2 or prev_prod.get("post_format") == "digest_carousel" else "carousel_video"
     else:
         prev_slides = None
@@ -2213,6 +2218,89 @@ def pair_all_photo_video_companions(
     return {"paired_count": len(paired_map), "pairs": paired_map}
 
 
+def _extract_focus_pair(val: Any) -> Optional[Tuple[float, float]]:
+    """Parse `(fx, fy)` from a list/tuple `[fx, fy]` or dict `{'crop_focus_x': fx, 'crop_focus_y': fy}`."""
+    if isinstance(val, (list, tuple)) and len(val) == 2:
+        try:
+            return (
+                max(0.0, min(1.0, float(val[0]))),
+                max(0.0, min(1.0, float(val[1]))),
+            )
+        except (TypeError, ValueError):
+            return None
+    if isinstance(val, dict):
+        raw_x = val.get("crop_focus_x") if val.get("crop_focus_x") is not None else val.get("x")
+        raw_y = val.get("crop_focus_y") if val.get("crop_focus_y") is not None else val.get("y")
+        if raw_x is not None and raw_y is not None:
+            try:
+                return (
+                    max(0.0, min(1.0, float(raw_x))),
+                    max(0.0, min(1.0, float(raw_y))),
+                )
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _resolve_record_crop_focus(
+    rec: Dict[str, Any],
+    asset_id: Optional[str] = None,
+    explicit_fx: Optional[float] = None,
+    explicit_fy: Optional[float] = None,
+) -> Tuple[float, float]:
+    """
+    Resolve `(crop_focus_x, crop_focus_y)` for a specific record/asset:
+    1. Explicit `(explicit_fx, explicit_fy)` if supplied
+    2. Matching observation `focal_point` for `asset_id` (or first observation with `focal_point`)
+       when `production.crop_focus_x/y` is still at default `(0.5, 0.5)`
+    3. `rec['production']['crop_focus_x']` and `rec['production']['crop_focus_y']`
+    """
+    prod = rec.get("production") or {}
+    base_fx = float(prod.get("crop_focus_x") if prod.get("crop_focus_x") is not None else 0.5)
+    base_fy = float(prod.get("crop_focus_y") if prod.get("crop_focus_y") is not None else 0.5)
+    if explicit_fx is not None or explicit_fy is not None:
+        return (
+            max(0.0, min(1.0, float(explicit_fx if explicit_fx is not None else base_fx))),
+            max(0.0, min(1.0, float(explicit_fy if explicit_fy is not None else base_fy))),
+        )
+    if abs(base_fx - 0.5) > 1e-4 or abs(base_fy - 0.5) > 1e-4:
+        return (max(0.0, min(1.0, base_fx)), max(0.0, min(1.0, base_fy)))
+    for obs in rec.get("observations") or []:
+        if asset_id and asset_id not in (obs.get("source_asset_ids") or []):
+            continue
+        pair = _extract_focus_pair(obs.get("focal_point"))
+        if pair is not None:
+            return pair
+    for obs in rec.get("observations") or []:
+        pair = _extract_focus_pair(obs.get("focal_point"))
+        if pair is not None:
+            return pair
+    return (max(0.0, min(1.0, base_fx)), max(0.0, min(1.0, base_fy)))
+
+
+def _render_cropped_slide_image(
+    raw_path: Path,
+    dest_path: Path,
+    focus_x: float,
+    focus_y: float,
+    trim_bottom_hud: bool = True,
+) -> Path:
+    """Render a 1080x1350 (4:5) cropped slide image centered around `(focus_x, focus_y)`."""
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(raw_path) as raw_im:
+        rgb_im = ImageOps.exif_transpose(raw_im).convert("RGB")
+    cropped_im = _crop_to_aspect_focus(
+        rgb_im,
+        1080,
+        1350,
+        max(0.0, min(1.0, float(focus_x))),
+        max(0.0, min(1.0, float(focus_y))),
+        trim_bottom_hud=trim_bottom_hud,
+    )
+    cropped_im.save(dest_path, format="JPEG", quality=92, optimize=True)
+    return dest_path
+
+
 def create_digest_dispatch(
     event_ids: List[str],
     headline: str,
@@ -2224,6 +2312,7 @@ def create_digest_dispatch(
     layout_position: str = "auto",
     crop_focus_x: Optional[float] = None,
     crop_focus_y: Optional[float] = None,
+    slide_crop_focus: Optional[Dict[str, Any]] = None,
     env_override: Optional[Dict[str, str]] = None,
     repo_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
@@ -2232,6 +2321,9 @@ def create_digest_dispatch(
     dispatch (`Weekend Edition` or `Developing Story`, up to 10 total Instagram slides:
     Slide 1 = 1080x1350 Front-Page Cover, Slides 2..N = sequential 10s camera videos or
     4:5 still frames from each constituent event).
+    Each slide has its own independent `(crop_focus_x, crop_focus_y)`, resolved from
+    `slide_crop_focus` (keyed by slide number `"1"`, `"2"`, ... or `event_id`) or from
+    each constituent sighting's own `production` / `observations` focal point.
     Marks secondary constituent events with `source.merged_into_event_id` so they are
     archived and never double-posted.
     """
@@ -2284,6 +2376,16 @@ def create_digest_dispatch(
     primary_out_dir = dirs["output"] / primary_eid
     primary_out_dir.mkdir(parents=True, exist_ok=True)
 
+    focus_map = slide_crop_focus or {}
+    s1_override = _extract_focus_pair(focus_map.get("1") or focus_map.get(1) or focus_map.get(primary_eid))
+    s1_fx, s1_fy = _resolve_record_crop_focus(
+        primary_rec,
+        explicit_fx=crop_focus_x if crop_focus_x is not None else (s1_override[0] if s1_override else None),
+        explicit_fy=crop_focus_y if crop_focus_y is not None else (s1_override[1] if s1_override else None),
+    )
+    primary_raw_assets = (primary_rec.get("source") or {}).get("assets") or []
+    primary_preview_path = primary_raw_assets[0].get("cached_preview_path") if primary_raw_assets else None
+
     merged_asset_ids: List[str] = list(primary_rec.get("source", {}).get("asset_ids") or [])
     merged_assets: List[Dict[str, Any]] = list(primary_rec.get("source", {}).get("assets") or [])
     merged_observations: List[Dict[str, Any]] = list(primary_rec.get("observations") or [])
@@ -2294,6 +2396,10 @@ def create_digest_dispatch(
             "kind": "cover",
             "event_id": primary_eid,
             "label": "Slide 1: 4:5 Front-Page Cover",
+            "raw_path": primary_preview_path,
+            "crop_focus_x": s1_fx,
+            "crop_focus_y": s1_fy,
+            "cropped_image_path": None,
             "path": None,
         }
     ]
@@ -2336,6 +2442,30 @@ def create_digest_dispatch(
 
         raw_assets_i = (rec_i.get("source") or {}).get("assets") or []
         preview_path = raw_assets_i[0].get("cached_preview_path") if raw_assets_i else None
+        first_aid_i = raw_assets_i[0].get("asset_id") if raw_assets_i else None
+
+        slide_override = _extract_focus_pair(
+            focus_map.get(str(idx))
+            or focus_map.get(idx)
+            or focus_map.get(eid)
+            or (focus_map.get(first_aid_i) if first_aid_i else None)
+        )
+        s_fx, s_fy = _resolve_record_crop_focus(
+            rec_i,
+            asset_id=first_aid_i,
+            explicit_fx=slide_override[0] if slide_override else None,
+            explicit_fy=slide_override[1] if slide_override else None,
+        )
+
+        cropped_slide_path: Optional[Path] = None
+        if preview_path and Path(preview_path).exists():
+            cropped_slide_path = _render_cropped_slide_image(
+                Path(preview_path),
+                primary_out_dir / f"digest-slide-{idx}.jpg",
+                s_fx,
+                s_fy,
+                trim_bottom_hud=True,
+            )
 
         if vid_path and vid_path.exists():
             carousel_slides.append(
@@ -2343,31 +2473,29 @@ def create_digest_dispatch(
                     "slide_number": idx,
                     "kind": "video",
                     "event_id": eid,
+                    "asset_id": first_aid_i,
+                    "raw_path": preview_path,
+                    "crop_focus_x": s_fx,
+                    "crop_focus_y": s_fy,
+                    "cropped_image_path": str(cropped_slide_path) if cropped_slide_path else preview_path,
                     "path": str(vid_path),
-                    "poster_path": preview_path,
+                    "poster_path": str(cropped_slide_path) if cropped_slide_path else preview_path,
                     "camera_stamp": stamp_i,
                     "label": f"▶ Slide {idx}: Clip {idx - 1} ({short_stamp})",
                 }
             )
-        elif preview_path and Path(preview_path).exists():
-            slide_img_path = primary_out_dir / f"digest-slide-{idx}.jpg"
-            with Image.open(preview_path) as raw_im:
-                rgb_im = ImageOps.exif_transpose(raw_im).convert("RGB")
-            cropped_im = _crop_to_aspect_focus(
-                rgb_im,
-                1080,
-                1350,
-                0.5,
-                0.5,
-                trim_bottom_hud=True,
-            )
-            cropped_im.save(slide_img_path, format="JPEG", quality=92, optimize=True)
+        elif cropped_slide_path and cropped_slide_path.exists():
             carousel_slides.append(
                 {
                     "slide_number": idx,
                     "kind": "image",
                     "event_id": eid,
-                    "path": str(slide_img_path),
+                    "asset_id": first_aid_i,
+                    "raw_path": preview_path,
+                    "crop_focus_x": s_fx,
+                    "crop_focus_y": s_fy,
+                    "cropped_image_path": str(cropped_slide_path),
+                    "path": str(cropped_slide_path),
                     "camera_stamp": stamp_i,
                     "label": f"Slide {idx}: Frame {idx - 1} ({short_stamp})",
                 }
@@ -2418,17 +2546,115 @@ def create_digest_dispatch(
         character_label=character_label,
         camera_stamp=composite_stamp,
         layout_position=layout_position,
-        crop_focus_x=crop_focus_x,
-        crop_focus_y=crop_focus_y,
+        crop_focus_x=s1_fx,
+        crop_focus_y=s1_fy,
         auto_render_cover=True,
         env_override=env_override,
         repo_dir=repo_dir,
     )
     carousel_slides[0]["path"] = drafted["production"].get("cover_path")
+    carousel_slides[0]["cropped_image_path"] = drafted["production"].get("cover_path")
+    carousel_slides[0]["crop_focus_x"] = drafted["production"].get("crop_focus_x", s1_fx)
+    carousel_slides[0]["crop_focus_y"] = drafted["production"].get("crop_focus_y", s1_fy)
     drafted["production"]["post_format"] = "digest_carousel"
     drafted["production"]["carousel_slides"] = carousel_slides
     _save_dispatch_record(dirs["dispatches"] / f"{primary_eid}.json", drafted, config)
     return drafted
+
+
+def recrop_carousel_slide(
+    event_id: str,
+    slide_number: int = 1,
+    crop_focus_x: Optional[float] = None,
+    crop_focus_y: Optional[float] = None,
+    layout_position: Optional[str] = None,
+    env_override: Optional[Dict[str, str]] = None,
+    repo_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """
+    Update the 4:5 crop focal point `(crop_focus_x, crop_focus_y)` for a specific slide
+    (`slide_number = 1..N`) on a dispatch and re-render that slide's 1080x1350 image/poster
+    without disturbing the focal points of other slides in the carousel.
+    """
+    snum = int(slide_number or 1)
+    if snum <= 1:
+        return render_dispatch_cover(
+            event_id=event_id,
+            layout_position=layout_position,
+            crop_focus_x=crop_focus_x,
+            crop_focus_y=crop_focus_y,
+            env_override=env_override,
+            repo_dir=repo_dir,
+        )
+
+    config = load_config(env_override=env_override, repo_dir=repo_dir)
+    dirs = ensure_runtime_dirs(config)
+    dispatch_path = dirs["dispatches"] / f"{event_id}.json"
+    record = load_dispatch_record(event_id, env_override=env_override, repo_dir=repo_dir)
+    prod = record.setdefault("production", {})
+    slides = prod.get("carousel_slides") or []
+
+    target_slide: Optional[Dict[str, Any]] = None
+    for sl in slides:
+        if int(sl.get("slide_number") or 0) == snum:
+            target_slide = sl
+            break
+
+    if target_slide is None:
+        raise WildlifeDeskError(
+            f"Dispatch {event_id} does not have a carousel slide #{snum} (total slides: {len(slides)})."
+        )
+
+    curr_fx = float(target_slide.get("crop_focus_x") if target_slide.get("crop_focus_x") is not None else 0.5)
+    curr_fy = float(target_slide.get("crop_focus_y") if target_slide.get("crop_focus_y") is not None else 0.5)
+    fx = max(0.0, min(1.0, float(crop_focus_x if crop_focus_x is not None else curr_fx)))
+    fy = max(0.0, min(1.0, float(crop_focus_y if crop_focus_y is not None else curr_fy)))
+
+    raw_path_str = target_slide.get("raw_path")
+    slide_eid = str(target_slide.get("event_id") or event_id)
+    if not raw_path_str or not Path(raw_path_str).exists():
+        # Look up uncropped preview from constituent event or merged source assets
+        if (dirs["dispatches"] / f"{slide_eid}.json").exists():
+            sub_rec = load_dispatch_record(slide_eid, env_override=env_override, repo_dir=repo_dir)
+            sub_assets = (sub_rec.get("source") or {}).get("assets") or []
+            if sub_assets and sub_assets[0].get("cached_preview_path"):
+                raw_path_str = sub_assets[0]["cached_preview_path"]
+        if (not raw_path_str or not Path(raw_path_str).exists()) and target_slide.get("poster_path"):
+            raw_path_str = target_slide.get("poster_path")
+        if (not raw_path_str or not Path(raw_path_str).exists()) and target_slide.get("path") and target_slide.get("kind") == "image":
+            raw_path_str = target_slide.get("path")
+
+    if not raw_path_str or not Path(raw_path_str).exists():
+        raise WildlifeDeskError(
+            f"Raw source image for slide #{snum} ({slide_eid}) not found in local media cache."
+        )
+
+    dest_path = dirs["output"] / event_id / f"digest-slide-{snum}.jpg"
+    _render_cropped_slide_image(Path(raw_path_str), dest_path, fx, fy, trim_bottom_hud=True)
+
+    target_slide["raw_path"] = str(raw_path_str)
+    target_slide["crop_focus_x"] = fx
+    target_slide["crop_focus_y"] = fy
+    target_slide["cropped_image_path"] = str(dest_path)
+    if target_slide.get("kind") == "image":
+        target_slide["path"] = str(dest_path)
+    elif target_slide.get("kind") == "video":
+        target_slide["poster_path"] = str(dest_path)
+
+    _save_dispatch_record(dispatch_path, record, config)
+
+    # Also keep constituent event record's crop_focus_x/y in sync if separate
+    if slide_eid != event_id and (dirs["dispatches"] / f"{slide_eid}.json").exists():
+        try:
+            sub_path = dirs["dispatches"] / f"{slide_eid}.json"
+            sub_rec = load_dispatch_record(slide_eid, env_override=env_override, repo_dir=repo_dir)
+            sub_rec.setdefault("production", {})["crop_focus_x"] = fx
+            sub_rec["production"]["crop_focus_y"] = fy
+            _save_dispatch_record(sub_path, sub_rec, config)
+        except Exception:
+            pass
+
+    return record
 
 
 # ---------------------------------------------------------------------------
@@ -3416,14 +3642,69 @@ def build_pressroom(
         is_digest_carousel = len(carousel_slides_cfg) > 2 or prod.get("post_format") == "digest_carousel"
         digest_slide_elements: List[str] = []
         digest_slide_buttons: List[str] = []
+        slide_crop_pills_html: List[str] = []
+        slide_crop_inputs_html: List[str] = []
         if is_digest_carousel and len(carousel_slides_cfg) >= 2:
+            s1_cfg = carousel_slides_cfg[0]
+            s1_fx = float(s1_cfg.get("crop_focus_x") if s1_cfg.get("crop_focus_x") is not None else focus_x_val)
+            s1_fy = float(s1_cfg.get("crop_focus_y") if s1_cfg.get("crop_focus_y") is not None else focus_y_val)
+            s1_raw_uri = (
+                _copy_pressroom_media(s1_cfg.get("raw_path"), press_media_dir, f"{eid}-slide1-raw.jpg")
+                or raw_uri
+                or ""
+            )
+            slide_crop_pills_html.append(
+                f'<button type="button" class="pos-pill slide-target-pill active" id="slide-pill-{eid}-1" '
+                f'data-slide="1" data-raw="{s1_raw_uri}" data-fx="{s1_fx:.3f}" data-fy="{s1_fy:.3f}" '
+                f'onclick="selectCropSlide(\'{eid}\', 1, true)">'
+                f'Slide 1 (Cover) <span class="pill-coords" id="pill-coords-{eid}-1">({s1_fx:.2f}, {s1_fy:.2f})</span>'
+                f'</button>'
+            )
+            slide_crop_inputs_html.append(
+                f'<div class="slide-crop-item" data-slide="1">'
+                f'<label>Slide 1 (Cover) Crop Focus X / Y</label>'
+                f'<div style="display:flex;gap:6px;">'
+                f'<input type="number" step="0.01" min="0" max="1" id="edit-slide-fx-{eid}-1" value="{s1_fx:.2f}" />'
+                f'<input type="number" step="0.01" min="0" max="1" id="edit-slide-fy-{eid}-1" value="{s1_fy:.2f}" />'
+                f'</div></div>'
+            )
             for sl in carousel_slides_cfg[1:]:
                 snum = int(sl.get("slide_number") or (len(digest_slide_elements) + 2))
                 skind = str(sl.get("kind") or "image")
                 slabel = _html_escape(sl.get("label") or f"Slide {snum}")
+                sl_fx = float(sl.get("crop_focus_x") if sl.get("crop_focus_x") is not None else 0.5)
+                sl_fy = float(sl.get("crop_focus_y") if sl.get("crop_focus_y") is not None else 0.5)
+                sl_raw_src = sl.get("raw_path") or sl.get("poster_path")
+                if (not sl_raw_src or not Path(sl_raw_src).exists()) and sl.get("event_id"):
+                    sub_disp_p = dirs["dispatches"] / f"{sl.get('event_id')}.json"
+                    if sub_disp_p.exists():
+                        try:
+                            sub_d = json.loads(sub_disp_p.read_text(encoding="utf-8"))
+                            sub_a = (sub_d.get("source") or {}).get("assets") or []
+                            if sub_a and sub_a[0].get("cached_preview_path"):
+                                sl_raw_src = sub_a[0]["cached_preview_path"]
+                        except Exception:
+                            pass
+                sl_raw_uri = _copy_pressroom_media(sl_raw_src, press_media_dir, f"{eid}-slide{snum}-raw.jpg") or raw_uri or ""
+                slide_crop_pills_html.append(
+                    f'<button type="button" class="pos-pill slide-target-pill" id="slide-pill-{eid}-{snum}" '
+                    f'data-slide="{snum}" data-raw="{sl_raw_uri}" data-fx="{sl_fx:.3f}" data-fy="{sl_fy:.3f}" '
+                    f'onclick="selectCropSlide(\'{eid}\', {snum}, true)">'
+                    f'Slide {snum} <span class="pill-coords" id="pill-coords-{eid}-{snum}">({sl_fx:.2f}, {sl_fy:.2f})</span>'
+                    f'</button>'
+                )
+                slide_crop_inputs_html.append(
+                    f'<div class="slide-crop-item" data-slide="{snum}">'
+                    f'<label>Slide {snum} Crop Focus X / Y</label>'
+                    f'<div style="display:flex;gap:6px;">'
+                    f'<input type="number" step="0.01" min="0" max="1" id="edit-slide-fx-{eid}-{snum}" value="{sl_fx:.2f}" />'
+                    f'<input type="number" step="0.01" min="0" max="1" id="edit-slide-fy-{eid}-{snum}" value="{sl_fy:.2f}" />'
+                    f'</div></div>'
+                )
                 if skind == "video":
                     s_uri = _copy_pressroom_media(sl.get("path"), press_media_dir, f"{eid}-slide{snum}.mp4")
-                    p_uri = _copy_pressroom_media(sl.get("poster_path"), press_media_dir, f"{eid}-slide{snum}-poster.jpg")
+                    p_src = sl.get("cropped_image_path") or sl.get("poster_path")
+                    p_uri = _copy_pressroom_media(p_src, press_media_dir, f"{eid}-slide{snum}-poster.jpg")
                     if s_uri:
                         digest_slide_buttons.append(
                             f"<button class='tab-btn' onclick=\"switchView('{eid}', 'slide{snum}')\">{slabel}</button>"
@@ -3700,13 +3981,14 @@ def build_pressroom(
                       <button type="button" class="pos-pill {'active' if curr_layout_pos == 'top-left' else ''}" data-pos="top-left" onclick="quickSetLayout('{eid}', 'top-left')">Top-L</button>
                       <button type="button" class="pos-pill {'active' if curr_layout_pos == 'top-right' else ''}" data-pos="top-right" onclick="quickSetLayout('{eid}', 'top-right')">Top-R</button>
                     </div>
+                    {f'<div class="layout-pills slide-crop-pills" id="slide-crop-pills-{eid}" style="width:100%;margin-top:4px;"><span class="studio-lbl">🎯 Crop Slide:</span>{"".join(slide_crop_pills_html)}</div>' if slide_crop_pills_html else ''}
                     <div class="crop-hint" id="crop-hint-{eid}">
                       🎯 Click <strong>Raw Frame</strong> tab &amp; click photo to set crop focus (<span id="focus-readout-{eid}">{focus_x_val:.2f}, {focus_y_val:.2f}</span>)
                     </div>
                   </div>
                   <div class="meta-strip">
                     <span>Assets: {len(raw_assets)}</span>
-                    <span>Format: {'2-Slide Carousel (Cover + Video)' if (video_uri and cover_uri) else ('Video' if video_uri else 'Single Image')}</span>
+                    <span>Format: {format_label}</span>
                     <span id="meta-stamp-{eid}">{f'Camera Stamp: <strong>{camera_stamp_str}</strong>' if camera_stamp_str else ''}</span>
                     <span>File Import/EXIF: {_html_escape(src.get('capture_time') or 'Unknown')}</span>
                     <span>TZ Verified: {'Yes' if src.get('capture_timezone_known') else 'No (Naive Camera Clock)'}</span>
@@ -3718,7 +4000,7 @@ def build_pressroom(
                   <details class="edit-drawer" id="editor-{eid}">
                     <summary>
                       <span>✎ Interactive Dispatch Editor &amp; Layout Controls</span>
-                      <span class="drawer-hint">Edit headline, caption, beat, HUD stamp, or hold state</span>
+                      <span class="drawer-hint">Edit headline, caption, beat, HUD stamp, per-slide crop, or hold state</span>
                     </summary>
                     <div class="edit-form">
                       <div class="edit-row-full">
@@ -3751,6 +4033,7 @@ def build_pressroom(
                           <input type="number" step="0.01" min="0" max="1" id="edit-focus-y-{eid}" value="{focus_y_val:.2f}" />
                         </div>
                       </div>
+                      {f'<div class="edit-row-grid slide-crops-grid" id="slide-crops-grid-{eid}">{"".join(slide_crop_inputs_html)}</div>' if slide_crop_inputs_html else ''}
                       <div class="edit-row-full">
                         <label for="edit-caption-{eid}">Instagram Caption Article</label>
                         <textarea id="edit-caption-{eid}" rows="6">{_html_escape(ed.get('caption') or '')}</textarea>
@@ -4856,9 +5139,58 @@ def build_pressroom(
       }}
     }}
 
-    function switchView(eid, mode) {{
+    const activeCropSlide = {{}};
+
+    function selectCropSlide(eid, slideNum, openRawTab) {{
+      const snum = parseInt(slideNum || 1, 10) || 1;
+      activeCropSlide[eid] = snum;
+      const pillBar = document.getElementById('slide-crop-pills-' + eid);
+      let fx = parseFloat(document.getElementById('edit-focus-x-' + eid)?.value || '0.5');
+      let fy = parseFloat(document.getElementById('edit-focus-y-' + eid)?.value || '0.5');
+      let rawSrc = null;
+
+      if (pillBar) {{
+        pillBar.querySelectorAll('.slide-target-pill').forEach(btn => {{
+          const bSlide = parseInt(btn.getAttribute('data-slide') || '1', 10);
+          const isMatch = bSlide === snum;
+          btn.classList.toggle('active', isMatch);
+          if (isMatch) {{
+            fx = parseFloat(btn.getAttribute('data-fx') || '0.5');
+            fy = parseFloat(btn.getAttribute('data-fy') || '0.5');
+            rawSrc = btn.getAttribute('data-raw') || null;
+          }}
+        }});
+      }}
+
+      const rawImg = document.getElementById('raw-photo-' + eid);
+      if (rawImg && rawSrc) {{
+        rawImg.src = rawSrc;
+      }}
+      const reticle = document.getElementById('reticle-' + eid);
+      if (reticle) {{
+        reticle.style.left = (fx * 100).toFixed(1) + '%';
+        reticle.style.top = (fy * 100).toFixed(1) + '%';
+      }}
+      const fReadout = document.getElementById('focus-readout-' + eid);
+      if (fReadout) {{
+        fReadout.textContent = 'Slide ' + snum + ': ' + fx.toFixed(2) + ', ' + fy.toFixed(2);
+      }}
+      if (openRawTab) {{
+        switchView(eid, 'raw', true);
+      }}
+    }}
+
+    function switchView(eid, mode, skipSlideSync) {{
       const card = document.getElementById('card-' + eid);
       if (!card) return;
+      if (!skipSlideSync) {{
+        if (mode === 'cover') {{
+          selectCropSlide(eid, 1, false);
+        }} else if (mode && mode.startsWith('slide')) {{
+          const snum = parseInt(mode.replace('slide', ''), 10);
+          if (snum >= 2) selectCropSlide(eid, snum, false);
+        }}
+      }}
       const prefix = 'img-' + eid + '-';
       const stageEls = card.querySelectorAll('.frame-stage .stage-img');
       stageEls.forEach(el => {{
@@ -4938,22 +5270,67 @@ def build_pressroom(
 
       const fx = typeof prod.crop_focus_x === 'number' ? prod.crop_focus_x : 0.5;
       const fy = typeof prod.crop_focus_y === 'number' ? prod.crop_focus_y : 0.5;
-      const reticle = document.getElementById('reticle-' + eid);
-      if (reticle) {{
-        reticle.style.left = (fx * 100).toFixed(1) + '%';
-        reticle.style.top = (fy * 100).toFixed(1) + '%';
-      }}
       const fxIn = document.getElementById('edit-focus-x-' + eid);
       const fyIn = document.getElementById('edit-focus-y-' + eid);
       if (fxIn) fxIn.value = fx.toFixed(2);
       if (fyIn) fyIn.value = fy.toFixed(2);
+
+      const slides = Array.isArray(prod.carousel_slides) ? prod.carousel_slides : [];
+      if (slides.length >= 2) {{
+        slides.forEach(sl => {{
+          const snum = parseInt(sl.slide_number || 1, 10);
+          const sfx = typeof sl.crop_focus_x === 'number' ? sl.crop_focus_x : (snum === 1 ? fx : 0.5);
+          const sfy = typeof sl.crop_focus_y === 'number' ? sl.crop_focus_y : (snum === 1 ? fy : 0.5);
+          const pill = document.getElementById('slide-pill-' + eid + '-' + snum);
+          if (pill) {{
+            pill.setAttribute('data-fx', sfx.toFixed(3));
+            pill.setAttribute('data-fy', sfy.toFixed(3));
+          }}
+          const coordsSpan = document.getElementById('pill-coords-' + eid + '-' + snum);
+          if (coordsSpan) {{
+            coordsSpan.textContent = '(' + sfx.toFixed(2) + ', ' + sfy.toFixed(2) + ')';
+          }}
+          const sFxIn = document.getElementById('edit-slide-fx-' + eid + '-' + snum);
+          const sFyIn = document.getElementById('edit-slide-fy-' + eid + '-' + snum);
+          if (sFxIn) sFxIn.value = sfx.toFixed(2);
+          if (sFyIn) sFyIn.value = sfy.toFixed(2);
+          if (snum >= 2) {{
+            const sEl = document.getElementById('img-' + eid + '-slide' + snum);
+            if (sEl) {{
+              if (sEl.tagName === 'VIDEO') {{
+                sEl.poster = 'media/' + eid + '-slide' + snum + '-poster.jpg?t=' + ts;
+              }} else {{
+                sEl.src = 'media/' + eid + '-slide' + snum + '.jpg?t=' + ts;
+              }}
+            }}
+          }}
+        }});
+      }}
+
+      const currSlide = activeCropSlide[eid] || 1;
+      let activeFx = fx;
+      let activeFy = fy;
+      if (slides.length >= 2) {{
+        const matchSl = slides.find(s => parseInt(s.slide_number || 1, 10) === currSlide);
+        if (matchSl) {{
+          if (typeof matchSl.crop_focus_x === 'number') activeFx = matchSl.crop_focus_x;
+          if (typeof matchSl.crop_focus_y === 'number') activeFy = matchSl.crop_focus_y;
+        }}
+      }}
+      const reticle = document.getElementById('reticle-' + eid);
+      if (reticle) {{
+        reticle.style.left = (activeFx * 100).toFixed(1) + '%';
+        reticle.style.top = (activeFy * 100).toFixed(1) + '%';
+      }}
       const fReadout = document.getElementById('focus-readout-' + eid);
-      if (fReadout) fReadout.textContent = fx.toFixed(2) + ', ' + fy.toFixed(2);
+      if (fReadout) {{
+        fReadout.textContent = (slides.length >= 2 ? ('Slide ' + currSlide + ': ') : '') + activeFx.toFixed(2) + ', ' + activeFy.toFixed(2);
+      }}
 
       const layoutPos = prod.layout_position || 'auto';
       const layoutSel = document.getElementById('edit-layout-' + eid);
       if (layoutSel) layoutSel.value = layoutPos;
-      document.querySelectorAll('#studio-bar-' + eid + ' .pos-pill').forEach(btn => {{
+      document.querySelectorAll('#studio-bar-' + eid + ' .pos-pill[data-pos]').forEach(btn => {{
         btn.classList.toggle('active', btn.getAttribute('data-pos') === layoutPos);
       }});
       const metaLayout = document.getElementById('meta-layout-' + eid);
@@ -5049,16 +5426,19 @@ def build_pressroom(
         reticle.style.left = (fx * 100).toFixed(1) + '%';
         reticle.style.top = (fy * 100).toFixed(1) + '%';
       }}
+      const snum = activeCropSlide[eid] || 1;
       const layoutPos = document.getElementById('edit-layout-' + eid)?.value || 'auto';
-      setEditStatus(eid, '⏳ Re-cropping & rendering 4:5 cover at (' + fx.toFixed(2) + ', ' + fy.toFixed(2) + ')...', false);
+      const slideLabel = snum === 1 ? 'Slide 1 (Cover)' : ('Slide ' + snum);
+      setEditStatus(eid, '⏳ Re-cropping & rendering ' + slideLabel + ' at (' + fx.toFixed(2) + ', ' + fy.toFixed(2) + ')...', false);
       try {{
         const res = await postPressroomApi('/api/dispatch/' + eid + '/recrop', {{
+          slide_number: snum,
           crop_focus_x: Number(fx.toFixed(3)),
           crop_focus_y: Number(fy.toFixed(3)),
           layout_position: layoutPos
         }});
         applyUpdatedRecordToDOM(eid, res.record, res.counts_by_state, res.cache_bust);
-        setEditStatus(eid, '✓ Re-rendered cover at focus (' + fx.toFixed(2) + ', ' + fy.toFixed(2) + ') — click Slide 1 to inspect', false);
+        setEditStatus(eid, '✓ Re-rendered ' + slideLabel + ' at focus (' + fx.toFixed(2) + ', ' + fy.toFixed(2) + ') — click ' + (snum === 1 ? 'Slide 1' : ('Slide ' + snum)) + ' tab to inspect', false);
       }} catch (err) {{
         setEditStatus(eid, '✗ Re-crop failed: ' + err.message, true);
       }}
@@ -5070,6 +5450,7 @@ def build_pressroom(
       setEditStatus(eid, '⏳ Rendering cover with layout=' + pos + '...', false);
       try {{
         const res = await postPressroomApi('/api/dispatch/' + eid + '/recrop', {{
+          slide_number: 1,
           layout_position: pos,
           crop_focus_x: fx,
           crop_focus_y: fy
@@ -5083,6 +5464,17 @@ def build_pressroom(
     }}
 
     async function saveDispatchDraft(eid) {{
+      const slideCrops = [];
+      const slideGrid = document.getElementById('slide-crops-grid-' + eid);
+      if (slideGrid) {{
+        slideGrid.querySelectorAll('.slide-crop-item').forEach(item => {{
+          const snum = parseInt(item.getAttribute('data-slide') || '1', 10);
+          const sfx = parseFloat(document.getElementById('edit-slide-fx-' + eid + '-' + snum)?.value || '0.5');
+          const sfy = parseFloat(document.getElementById('edit-slide-fy-' + eid + '-' + snum)?.value || '0.5');
+          slideCrops.push({{ slide_number: snum, crop_focus_x: sfx, crop_focus_y: sfy }});
+        }});
+      }}
+      const s1Crop = slideCrops.find(c => c.slide_number === 1);
       const payload = {{
         headline: document.getElementById('edit-headline-' + eid)?.value || '',
         caption: document.getElementById('edit-caption-' + eid)?.value || '',
@@ -5090,8 +5482,9 @@ def build_pressroom(
         character_label: document.getElementById('edit-char-' + eid)?.value || '',
         camera_stamp: document.getElementById('edit-stamp-' + eid)?.value || '',
         layout_position: document.getElementById('edit-layout-' + eid)?.value || 'auto',
-        crop_focus_x: parseFloat(document.getElementById('edit-focus-x-' + eid)?.value || '0.5'),
-        crop_focus_y: parseFloat(document.getElementById('edit-focus-y-' + eid)?.value || '0.5')
+        crop_focus_x: s1Crop ? s1Crop.crop_focus_x : parseFloat(document.getElementById('edit-focus-x-' + eid)?.value || '0.5'),
+        crop_focus_y: s1Crop ? s1Crop.crop_focus_y : parseFloat(document.getElementById('edit-focus-y-' + eid)?.value || '0.5'),
+        slide_crops: slideCrops
       }};
       setEditStatus(eid, '⏳ Saving draft & rendering cover...', false);
       try {{
@@ -5226,9 +5619,25 @@ def handle_pressroom_api_action(
                 env_override=env_override,
                 repo_dir=repo_dir,
             )
+            slide_crops = body.get("slide_crops")
+            if isinstance(slide_crops, list):
+                for sc in slide_crops:
+                    if not isinstance(sc, dict):
+                        continue
+                    snum = int(sc.get("slide_number") or 1)
+                    if snum >= 2 and sc.get("crop_focus_x") is not None and sc.get("crop_focus_y") is not None:
+                        rec = recrop_carousel_slide(
+                            event_id=event_id,
+                            slide_number=snum,
+                            crop_focus_x=float(sc["crop_focus_x"]),
+                            crop_focus_y=float(sc["crop_focus_y"]),
+                            env_override=env_override,
+                            repo_dir=repo_dir,
+                        )
         elif action == "recrop":
-            rec = render_dispatch_cover(
+            rec = recrop_carousel_slide(
                 event_id=event_id,
+                slide_number=int(body.get("slide_number") or 1),
                 layout_position=str(body.get("layout_position") or "").strip() or None,
                 crop_focus_x=float(body["crop_focus_x"]) if body.get("crop_focus_x") is not None else None,
                 crop_focus_y=float(body["crop_focus_y"]) if body.get("crop_focus_y") is not None else None,
@@ -5560,6 +5969,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Automatically pair all still-image sightings with their companion 10-second camera videos",
     )
 
+    p_recrop_slide = sub.add_parser(
+        "recrop-slide",
+        help="Update the 4:5 crop focal point for a specific carousel slide (1..N) and re-render that slide",
+    )
+    p_recrop_slide.add_argument("event_id", help="Target dispatch event_id")
+    p_recrop_slide.add_argument("--slide", type=int, default=1, help="Slide number (1..N, default: 1)")
+    p_recrop_slide.add_argument("--focus-x", type=float, required=True, help="Normalized crop focus X (0.0..1.0)")
+    p_recrop_slide.add_argument("--focus-y", type=float, required=True, help="Normalized crop focus Y (0.0..1.0)")
+    p_recrop_slide.add_argument("--layout", default=None, help="Optional headline box layout for Slide 1")
+
     p_sched = sub.add_parser(
         "schedule",
         help="Show the upcoming Tue/Thu/Sat publication schedule for all READY dispatches",
@@ -5607,6 +6026,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
     if args.command == "pair-companions":
         print(json.dumps(pair_all_photo_video_companions(), indent=2))
+        return 0
+    if args.command == "recrop-slide":
+        res = recrop_carousel_slide(
+            event_id=args.event_id,
+            slide_number=args.slide,
+            crop_focus_x=args.focus_x,
+            crop_focus_y=args.focus_y,
+            layout_position=args.layout,
+        )
+        print(json.dumps(res, indent=2))
         return 0
     if args.command == "schedule":
         print(
